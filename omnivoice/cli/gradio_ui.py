@@ -412,8 +412,8 @@ def load_settings() -> Dict[str, Any]:
         "normalize_level": -20,
         "use_zipenhancer": True,
         "speed": 1.0,
-        "num_step": 12,
-        "guidance_scale": 3.0,
+        "num_step": 16,
+        "guidance_scale": 2.0,
         "denoise": True,
         "preprocess_prompt": True,
         "postprocess_output": True,
@@ -788,8 +788,8 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
         with gr.Accordion("⚙️ Settings", open=True):
             sp = gr.Slider(0.5, 1.5, value=settings.get("speed", 1.0), step=0.05, label="Speed")
             du = gr.Number(value=None, label="Duration (seconds)", info="Leave blank to use speed settings")
-            ns = gr.Slider(4, 25, value=settings.get("num_step", 12), step=1, label="Inference Steps", info="12-16 optimal")
-            gs = gr.Slider(1.0, 4.0, value=settings.get("guidance_scale", 3.0), step=0.1, label="Guidance Scale (CFG)")
+            ns = gr.Slider(4, 25, value=settings.get("num_step", 16), step=1, label="Inference Steps", info="12-16 optimal")
+            gs = gr.Slider(1.0, 4.0, value=settings.get("guidance_scale", 2.0), step=0.1, label="Guidance Scale (CFG)")
             dn = gr.Checkbox(label="Denoise", value=settings.get("denoise", True))
             pp = gr.Checkbox(label="Preprocess Prompt", value=settings.get("preprocess_prompt", True))
             po = gr.Checkbox(label="Postprocess Output", value=settings.get("postprocess_output", True))
