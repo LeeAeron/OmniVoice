@@ -14,6 +14,7 @@ import threading
 import time
 import json
 import warnings
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -343,25 +344,25 @@ def ensure_zipenhancer_downloaded() -> Path:
     """Download ZipEnhancer model from ModelScope if not present locally."""
     local_dir = MODELS_DIR / "zipenhancer"
     marker_file = local_dir / ".download_complete"
-    
+
     if marker_file.exists():
         logging.info(f"ZipEnhancer found locally: {local_dir}")
         return local_dir
-    
+
     logging.info("Downloading ZipEnhancer model from ModelScope...")
     try:
         from modelscope import snapshot_download
-        
+
         local_dir.mkdir(parents=True, exist_ok=True)
         downloaded_path = snapshot_download(
             'iic/speech_zipenhancer_ans_multiloss_16k_base',
             local_dir=str(local_dir),
         )
-        
+
         marker_file.touch()
         logging.info(f"ZipEnhancer downloaded to: {local_dir}")
         return Path(downloaded_path)
-        
+
     except Exception as e:
         logging.error(f"Failed to download ZipEnhancer: {e}")
         raise RuntimeError(f"Failed to download ZipEnhancer: {e}")
@@ -369,18 +370,18 @@ def ensure_zipenhancer_downloaded() -> Path:
 
 class ZipEnhancerProcessor:
     """Wrapper for ZipEnhancer speech enhancement model."""
-    
+
     def __init__(self, model_dir: Path):
         self.model_dir = model_dir
         self.model = None
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self._load_model()
-    
+
     def _load_model(self):
         try:
             from modelscope.pipelines import pipeline
             from modelscope.utils.constant import Tasks
-            
+
             self.pipeline = pipeline(
                 task=Tasks.acoustic_noise_suppression,
                 model=str(self.model_dir),
@@ -390,7 +391,7 @@ class ZipEnhancerProcessor:
         except Exception as e:
             logging.error(f"Failed to load ZipEnhancer: {e}")
             raise
-    
+
     def enhance(self, audio_path: str, output_path: str) -> str:
         """Enhance audio file and save result."""
         try:
@@ -421,11 +422,13 @@ def load_settings() -> Dict[str, Any]:
         "output_sample_rate": 48000,
         "bitrate": 320,
         "language": "Auto",
+        "seed": -1,
+        "random_seed": True,
     }
-    
+
     if not SETTINGS_FILE.exists():
         return defaults
-    
+
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             saved = json.load(f)
@@ -458,34 +461,34 @@ def normalize_audio(waveform: np.ndarray, target_level_db: float) -> np.ndarray:
     """
     if waveform.size == 0:
         return waveform
-    
+
     # Convert to float
     if waveform.dtype == np.int16:
         waveform_float = waveform.astype(np.float32) / 32768.0
     else:
         waveform_float = waveform.astype(np.float32)
-    
+
     # Calculate current RMS
     rms = np.sqrt(np.mean(waveform_float ** 2))
     if rms < 1e-10:
         return waveform
-    
+
     # Target RMS from dB
     target_rms = 10 ** (target_level_db / 20.0)
-    
+
     # Gain factor
     gain = target_rms / rms
-    
+
     # Apply gain
     normalized = waveform_float * gain
-    
+
     # Clip to prevent overflow
     normalized = np.clip(normalized, -1.0, 1.0)
-    
+
     # Convert back to int16
     if waveform.dtype == np.int16:
         return (normalized * 32767).astype(np.int16)
-    
+
     return normalized
 
 
@@ -623,18 +626,46 @@ def build_parser() -> argparse.ArgumentParser:
 def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
     sampling_rate = model.sampling_rate
     settings = load_settings()
-    
+
     # Initialize ZipEnhancer if needed (lazy load on first use)
     zipenhancer = None
+
+    def _set_seed(seed_value: int):
+        """Set PyTorch random seed for reproducible generation."""
+        if seed_value is not None and int(seed_value) >= 0:
+            seed = int(seed_value)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            np.random.seed(seed)
+            random.seed(seed)
+            logging.info(f"Seed set to: {seed}")
+            return seed
+        else:
+            # Random seed
+            seed = random.randint(0, 2**32 - 1)
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            np.random.seed(seed)
+            random.seed(seed)
+            logging.info(f"Random seed used: {seed}")
+            return seed
 
     def _gen_core(text, language, ref_audio, instruct, num_step, guidance_scale, 
                   denoise, speed, duration, preprocess_prompt, postprocess_output, 
                   output_format, mode, ref_text=None,
                   normalize=True, normalize_level=-20, use_zipenhancer=True,
-                  target_sample_rate=48000, bitrate=320):
+                  target_sample_rate=48000, bitrate=320, seed=-1, random_seed=True):
 
         if not text or not text.strip():
             return None, "Enter text to be synthesized", None, None
+
+        # Set seed before generation
+        if random_seed:
+            actual_seed = _set_seed(-1)
+        else:
+            actual_seed = _set_seed(seed)
 
         effective_steps = min(int(num_step or 12), 25)
 
@@ -682,33 +713,33 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
 
         # Track the actual sample rate of the audio data
         current_sr = sampling_rate  # Starts at model's native rate (16kHz)
-        
+
         # Apply ZipEnhancer if enabled (at 16kHz, BEFORE upsampling to 48kHz)
         if use_zipenhancer:
             nonlocal zipenhancer
             if zipenhancer is None:
                 zipenhancer_dir = ensure_zipenhancer_downloaded()
                 zipenhancer = ZipEnhancerProcessor(zipenhancer_dir)
-            
+
             # Save float32 to temp file for ZipEnhancer
             temp_path = OUTPUTS_DIR / f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
             sf.write(temp_path, waveform, current_sr)
-            
+
             enhanced_path = str(temp_path.with_suffix('.enhanced.wav'))
             try:
                 enhanced_path = zipenhancer.enhance(str(temp_path), enhanced_path)
-                
+
                 # Read enhanced result AND its actual sample rate
                 waveform, current_sr = sf.read(enhanced_path)
-                
+
                 # Cleanup
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
                 if os.path.exists(enhanced_path):
                     os.unlink(enhanced_path)
-                    
+
                 logging.info(f"ZipEnhancer output: {current_sr}Hz")
-                
+
             except Exception as e:
                 logging.error(f"ZipEnhancer failed, keeping original: {e}")
                 if temp_path and os.path.exists(temp_path):
@@ -740,7 +771,8 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
             logging.warning(f"Failed to generate spectrogram: {e}")
             spectrogram_path = None
 
-        return (current_sr, waveform), "Done! Saved in: " + Path(saved_path).name, saved_path, spectrogram_path
+        status_msg = f"Done! Saved in: {Path(saved_path).name} | Seed: {actual_seed}"
+        return (current_sr, waveform), status_msg, saved_path, spectrogram_path
 
     theme = gr.themes.Soft(font=["Inter", "Arial", "sans-serif"])
 
@@ -750,6 +782,9 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
     .voice-controls-row {align-items: center !important;}
     .voice-controls-row button {height: 40px !important; margin-top: 24px !important;}
     .generate-btn-row {margin-bottom: 10px !important;}
+    .seed-row {align-items: center !important; gap: 8px !important;}
+    .seed-row button {height: 40px !important; margin-top: 24px !important; min-width: 40px !important;}
+    .seed-row .form {margin-bottom: 0 !important;}
     """
 
     # JavaScript to reload the current tab after server restart
@@ -793,7 +828,28 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
             dn = gr.Checkbox(label="Denoise", value=settings.get("denoise", True))
             pp = gr.Checkbox(label="Preprocess Prompt", value=settings.get("preprocess_prompt", True))
             po = gr.Checkbox(label="Postprocess Output", value=settings.get("postprocess_output", True))
-            
+
+            # Seed controls
+            with gr.Row(elem_classes="seed-row"):
+                seed_input = gr.Number(
+                    value=settings.get("seed", -1),
+                    label="Seed",
+                    info="-1 = random, 0+ = fixed",
+                    precision=0,
+                    scale=2
+                )
+                random_seed_cb = gr.Checkbox(
+                    label="Random Seed",
+                    value=settings.get("random_seed", True),
+                    scale=1
+                )
+                random_seed_btn = gr.Button(
+                    "🎲",
+                    elem_classes="square-btn",
+                    scale=0,
+                    min_width=40
+                )
+
             with gr.Row():
                 fmt = gr.Dropdown(
                     choices=AUDIO_FORMATS,
@@ -807,7 +863,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                     label="Output Sample Rate (Hz)",
                     scale=1
                 )
-            
+
             # Bitrate only shown for lossy formats
             br = gr.Dropdown(
                 choices=BITRATE_OPTIONS,
@@ -815,8 +871,8 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                 label="Bitrate (kbps) - for MP3/OGG/AAC",
                 visible=True
             )
-            
-        return ns, gs, sp, du, dn, pp, po, fmt, sr, br
+
+        return ns, gs, sp, du, dn, pp, po, fmt, sr, br, seed_input, random_seed_cb, random_seed_btn
 
     with gr.Blocks(title="OmniVoice Portable") as demo:
         gr.Markdown("<div align='center'><h1>OmniVoice Portable</h1></div>")
@@ -854,8 +910,8 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                         vc_ref_text = gr.Textbox(label="Reference Text", lines=1, 
                                                   placeholder="Leave empty for automatic transcription")
                         vc_lang = _lang_dropdown(value=settings.get("language", "Auto"))
-                        vc_ns, vc_gs, vc_sp, vc_du, vc_dn, vc_pp, vc_po, vc_fmt, vc_sr, vc_br = _gen_settings()
-                        
+                        vc_ns, vc_gs, vc_sp, vc_du, vc_dn, vc_pp, vc_po, vc_fmt, vc_sr, vc_br, vc_seed, vc_random_seed, vc_random_btn = _gen_settings()
+
                         # Audio Processing controls
                         with gr.Accordion("🔊 Audio Processing", open=True):
                             vc_normalize = gr.Checkbox(
@@ -938,7 +994,18 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                     outputs=[vc_ref_audio],
                 )
 
-                def _clone_fn(text, lang, ref_aud, ref_text, ns, gs, dn, sp, du, pp, po, fmt, sr, br,
+                # Random seed button handler
+                def _random_seed():
+                    new_seed = random.randint(0, 2**32 - 1)
+                    return gr.update(value=new_seed)
+
+                vc_random_btn.click(
+                    _random_seed,
+                    inputs=None,
+                    outputs=vc_seed,
+                )
+
+                def _clone_fn(text, lang, ref_aud, ref_text, ns, gs, dn, sp, du, pp, po, fmt, sr, br, seed, random_seed,
                              normalize, norm_level, use_zipenhancer):
                     # Save settings before generation
                     current_settings = {
@@ -952,20 +1019,23 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                         "output_sample_rate": sr,
                         "bitrate": br,
                         "language": lang,
+                        "seed": seed,
+                        "random_seed": random_seed,
                         "normalize": normalize,
                         "normalize_level": norm_level,
                         "use_zipenhancer": use_zipenhancer,
                     }
                     save_settings(current_settings)
-                    
+
                     return _gen_core(text, lang, ref_aud, None, ns, gs, dn, sp, du, pp, po, fmt,
                                    mode="clone", ref_text=ref_text or None,
                                    normalize=normalize, normalize_level=norm_level,
                                    use_zipenhancer=use_zipenhancer,
-                                   target_sample_rate=sr, bitrate=br)
+                                   target_sample_rate=sr, bitrate=br,
+                                   seed=seed, random_seed=random_seed)
 
                 vc_btn.click(_clone_fn,
-                    inputs=[vc_text, vc_lang, vc_ref_audio, vc_ref_text, vc_ns, vc_gs, vc_dn, vc_sp, vc_du, vc_pp, vc_po, vc_fmt, vc_sr, vc_br,
+                    inputs=[vc_text, vc_lang, vc_ref_audio, vc_ref_text, vc_ns, vc_gs, vc_dn, vc_sp, vc_du, vc_pp, vc_po, vc_fmt, vc_sr, vc_br, vc_seed, vc_random_seed,
                            vc_normalize, vc_norm_level, vc_use_zipenhancer],
                     outputs=[vc_audio, vc_status, vc_saved_file, vc_spectrogram])
 
@@ -1008,8 +1078,8 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                         for _cat, _choices in _CATEGORIES.items():
                             vd_groups.append(gr.Dropdown(label=_cat, choices=["Auto"] + _choices, value="Auto"))
 
-                        vd_ns, vd_gs, vd_sp, vd_du, vd_dn, vd_pp, vd_po, vd_fmt, vd_sr, vd_br = _gen_settings()
-                        
+                        vd_ns, vd_gs, vd_sp, vd_du, vd_dn, vd_pp, vd_po, vd_fmt, vd_sr, vd_br, vd_seed, vd_random_seed, vd_random_btn = _gen_settings()
+
                         # Audio Processing controls
                         with gr.Accordion("🔊 Audio Processing", open=True):
                             vd_normalize = gr.Checkbox(
@@ -1092,6 +1162,13 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                     outputs=[vd_ref_audio],
                 )
 
+                # Random seed button handler
+                vd_random_btn.click(
+                    _random_seed,
+                    inputs=None,
+                    outputs=vd_seed,
+                )
+
                 def _build_instruct(groups):
                     selected = [g for g in groups if g and g != "Auto"]
                     if not selected:
@@ -1105,14 +1182,14 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                             parts.append(v)
                     return ", ".join(parts)
 
-                def _design_fn(text, lang, ref_aud, ns, gs, dn, sp, du, pp, po, fmt, sr, br, *args):
+                def _design_fn(text, lang, ref_aud, ns, gs, dn, sp, du, pp, po, fmt, sr, br, seed, random_seed, *args):
                     # Separate groups from audio processing args
                     num_groups = len(vd_groups)
                     groups = args[:num_groups]
                     normalize = args[num_groups]
                     norm_level = args[num_groups + 1]
                     use_zipenhancer = args[num_groups + 2]
-                    
+
                     # Save settings before generation
                     current_settings = {
                         "speed": sp,
@@ -1125,27 +1202,31 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                         "output_sample_rate": sr,
                         "bitrate": br,
                         "language": lang,
+                        "seed": seed,
+                        "random_seed": random_seed,
                         "normalize": normalize,
                         "normalize_level": norm_level,
                         "use_zipenhancer": use_zipenhancer,
                     }
                     save_settings(current_settings)
-                    
+
                     if ref_aud:
                         return _gen_core(text, lang, ref_aud, None, ns, gs, dn, sp, du, pp, po, fmt,
                                        mode="clone", ref_text=None,
                                        normalize=normalize, normalize_level=norm_level,
                                        use_zipenhancer=use_zipenhancer,
-                                       target_sample_rate=sr, bitrate=br)
+                                       target_sample_rate=sr, bitrate=br,
+                                       seed=seed, random_seed=random_seed)
                     else:
                         return _gen_core(text, lang, None, _build_instruct(groups), ns, gs, dn, sp, du, pp, po, fmt, 
                                        mode="design",
                                        normalize=normalize, normalize_level=norm_level,
                                        use_zipenhancer=use_zipenhancer,
-                                       target_sample_rate=sr, bitrate=br)
+                                       target_sample_rate=sr, bitrate=br,
+                                       seed=seed, random_seed=random_seed)
 
                 vd_btn.click(_design_fn,
-                    inputs=[vd_text, vd_lang, vd_ref_audio, vd_ns, vd_gs, vd_dn, vd_sp, vc_du, vd_pp, vd_po, vd_fmt, vd_sr, vd_br] + vd_groups + [vd_normalize, vd_norm_level, vd_use_zipenhancer],
+                    inputs=[vd_text, vd_lang, vd_ref_audio, vd_ns, vd_gs, vd_dn, vd_sp, vd_du, vd_pp, vd_po, vd_fmt, vd_sr, vd_br, vd_seed, vd_random_seed] + vd_groups + [vd_normalize, vd_norm_level, vd_use_zipenhancer],
                     outputs=[vd_audio, vd_status, vd_saved_file, vd_spectrogram])
 
                 vd_restart_btn.click(
