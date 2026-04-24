@@ -49,6 +49,7 @@ CWD = Path(os.getcwd()).absolute()
 OUTPUTS_DIR = CWD / "outputs"
 REFERENCE_AUDIO_DIR = CWD / "reference_audio"
 MODELS_DIR = CWD / "models"
+SETTINGS_FILE = CWD / "settings.txt"
 
 OUTPUTS_DIR.mkdir(exist_ok=True)
 REFERENCE_AUDIO_DIR.mkdir(exist_ok=True)
@@ -65,6 +66,7 @@ logging.info(f"Outputs will be saved to: {OUTPUTS_DIR}")
 logging.info(f"Reference voices folder: {REFERENCE_AUDIO_DIR}")
 logging.info(f"Models folder: {MODELS_DIR}")
 logging.info(f"HF Cache: {MODELS_DIR / 'hf_cache'}")
+logging.getLogger("modelscope").setLevel(logging.ERROR)
 
 from huggingface_hub import constants as hf_constants
 hf_constants.HF_HUB_CACHE = MODELS_DIR / "hf_cache"
@@ -87,6 +89,15 @@ _ALL_LANGUAGES = ["Auto"] + sorted(lang_display_name(n) for n in LANG_NAMES)
 AUDIO_FORMATS = ["wav", "mp3", "flac", "ogg", "m4a", "aac"]
 TARGET_SAMPLE_RATE = 48000
 
+# Normalization levels
+NORMALIZATION_LEVELS = [-20, -19, -18, -17, -16, -15, -14, -13, -12, -11, -10, -9, -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+# Bitrate options for lossy formats (kbps)
+BITRATE_OPTIONS = [64, 96, 128, 160, 192, 224, 256, 320]
+
+# Output sample rate options
+OUTPUT_SAMPLE_RATES = [24000, 32000, 44100, 48000]
+
 
 def get_best_device():
     if torch.cuda.is_available():
@@ -96,8 +107,8 @@ def get_best_device():
     return "cpu"
 
 
-def save_audio_with_ffmpeg(waveform: np.ndarray, sample_rate: int, fmt: str = "wav", prefix: str = "omnivoice") -> str:
-    """Saving audio via ffmpeg."""
+def save_audio_with_ffmpeg(waveform: np.ndarray, sample_rate: int, fmt: str = "wav", prefix: str = "omnivoice", target_sr: int = 48000, bitrate: int = 192) -> str:
+    """Saving audio via ffmpeg with configurable sample rate and bitrate."""
     fmt = fmt.lower().replace(".", "")
     if fmt not in AUDIO_FORMATS:
         fmt = "wav"
@@ -111,14 +122,16 @@ def save_audio_with_ffmpeg(waveform: np.ndarray, sample_rate: int, fmt: str = "w
         tmp_wav_path = tmp_wav.name
 
     try:
-        cmd = ["ffmpeg", "-y", "-i", tmp_wav_path, "-ar", str(TARGET_SAMPLE_RATE)]
+        cmd = ["ffmpeg", "-y", "-i", tmp_wav_path, "-ar", str(target_sr)]
 
         if fmt == "mp3":
-            cmd.extend(["-c:a", "libmp3lame", "-q:a", "2"])
+            cmd.extend(["-c:a", "libmp3lame", "-b:a", f"{bitrate}k"])
         elif fmt == "ogg":
-            cmd.extend(["-c:a", "libvorbis", "-q:a", "4"])
+            cmd.extend(["-c:a", "libvorbis", "-q:a", "4"])  # Vorbis uses quality, not bitrate directly
+            # Alternative: use opus for better quality control
+            # cmd.extend(["-c:a", "libopus", "-b:a", f"{bitrate}k"])
         elif fmt == "m4a" or fmt == "aac":
-            cmd.extend(["-c:a", "aac", "-b:a", "192k"])
+            cmd.extend(["-c:a", "aac", "-b:a", f"{bitrate}k"])
         elif fmt == "flac":
             cmd.extend(["-c:a", "flac"])
         else:
@@ -132,7 +145,7 @@ def save_audio_with_ffmpeg(waveform: np.ndarray, sample_rate: int, fmt: str = "w
             out_path = out_path.with_suffix(".wav")
             sf.write(out_path, waveform, sample_rate)
         else:
-            logging.info(f"Saved (resampled to {TARGET_SAMPLE_RATE}Hz): {out_path}")
+            logging.info(f"Saved (resampled to {target_sr}Hz): {out_path}")
 
     finally:
         os.unlink(tmp_wav_path)
@@ -324,6 +337,158 @@ def download_whisper_model(model_name: str = "openai/whisper-large-v3", local_di
         raise
 
 
+# SPEECH ENHANCEMENT
+
+def ensure_zipenhancer_downloaded() -> Path:
+    """Download ZipEnhancer model from ModelScope if not present locally."""
+    local_dir = MODELS_DIR / "zipenhancer"
+    marker_file = local_dir / ".download_complete"
+    
+    if marker_file.exists():
+        logging.info(f"ZipEnhancer found locally: {local_dir}")
+        return local_dir
+    
+    logging.info("Downloading ZipEnhancer model from ModelScope...")
+    try:
+        from modelscope import snapshot_download
+        
+        local_dir.mkdir(parents=True, exist_ok=True)
+        downloaded_path = snapshot_download(
+            'iic/speech_zipenhancer_ans_multiloss_16k_base',
+            local_dir=str(local_dir),
+        )
+        
+        marker_file.touch()
+        logging.info(f"ZipEnhancer downloaded to: {local_dir}")
+        return Path(downloaded_path)
+        
+    except Exception as e:
+        logging.error(f"Failed to download ZipEnhancer: {e}")
+        raise RuntimeError(f"Failed to download ZipEnhancer: {e}")
+
+
+class ZipEnhancerProcessor:
+    """Wrapper for ZipEnhancer speech enhancement model."""
+    
+    def __init__(self, model_dir: Path):
+        self.model_dir = model_dir
+        self.model = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._load_model()
+    
+    def _load_model(self):
+        try:
+            from modelscope.pipelines import pipeline
+            from modelscope.utils.constant import Tasks
+            
+            self.pipeline = pipeline(
+                task=Tasks.acoustic_noise_suppression,
+                model=str(self.model_dir),
+                device=self.device,
+            )
+            logging.info(f"ZipEnhancer loaded on {self.device}")
+        except Exception as e:
+            logging.error(f"Failed to load ZipEnhancer: {e}")
+            raise
+    
+    def enhance(self, audio_path: str, output_path: str) -> str:
+        """Enhance audio file and save result."""
+        try:
+            result = self.pipeline(audio_path, output_path=output_path)
+            logging.info(f"Audio enhanced: {output_path}")
+            return output_path
+        except Exception as e:
+            logging.error(f"Enhancement failed: {e}")
+            # Return original if enhancement fails
+            return audio_path
+
+
+# SETTINGS MANAGEMENT
+
+def load_settings() -> Dict[str, Any]:
+    """Load settings from settings.txt."""
+    defaults = {
+        "normalize": True,
+        "normalize_level": -20,
+        "use_zipenhancer": True,
+        "speed": 1.0,
+        "num_step": 12,
+        "guidance_scale": 3.0,
+        "denoise": True,
+        "preprocess_prompt": True,
+        "postprocess_output": True,
+        "output_format": "wav",
+        "output_sample_rate": 48000,
+        "bitrate": 320,
+        "language": "Auto",
+    }
+    
+    if not SETTINGS_FILE.exists():
+        return defaults
+    
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        # Merge with defaults
+        for key, val in defaults.items():
+            if key not in saved:
+                saved[key] = val
+        return saved
+    except Exception as e:
+        logging.warning(f"Failed to load settings: {e}")
+        return defaults
+
+
+def save_settings(settings: Dict[str, Any]):
+    """Save settings to settings.txt."""
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+        logging.info(f"Settings saved to {SETTINGS_FILE}")
+    except Exception as e:
+        logging.error(f"Failed to save settings: {e}")
+
+
+# AUDIO NORMALIZATION
+
+def normalize_audio(waveform: np.ndarray, target_level_db: float) -> np.ndarray:
+    """
+    Normalize audio to target RMS level in dB.
+    target_level_db: -5 to +5 dB relative to full scale.
+    """
+    if waveform.size == 0:
+        return waveform
+    
+    # Convert to float
+    if waveform.dtype == np.int16:
+        waveform_float = waveform.astype(np.float32) / 32768.0
+    else:
+        waveform_float = waveform.astype(np.float32)
+    
+    # Calculate current RMS
+    rms = np.sqrt(np.mean(waveform_float ** 2))
+    if rms < 1e-10:
+        return waveform
+    
+    # Target RMS from dB
+    target_rms = 10 ** (target_level_db / 20.0)
+    
+    # Gain factor
+    gain = target_rms / rms
+    
+    # Apply gain
+    normalized = waveform_float * gain
+    
+    # Clip to prevent overflow
+    normalized = np.clip(normalized, -1.0, 1.0)
+    
+    # Convert back to int16
+    if waveform.dtype == np.int16:
+        return (normalized * 32767).astype(np.int16)
+    
+    return normalized
+
+
 class FullOffloadOmniVoice:
     def __init__(self, checkpoint: str):
         self.checkpoint = checkpoint
@@ -457,10 +622,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
     sampling_rate = model.sampling_rate
+    settings = load_settings()
+    
+    # Initialize ZipEnhancer if needed (lazy load on first use)
+    zipenhancer = None
 
     def _gen_core(text, language, ref_audio, instruct, num_step, guidance_scale, 
                   denoise, speed, duration, preprocess_prompt, postprocess_output, 
-                  output_format, mode, ref_text=None):
+                  output_format, mode, ref_text=None,
+                  normalize=True, normalize_level=-20, use_zipenhancer=True,
+                  target_sample_rate=48000, bitrate=320):
 
         if not text or not text.strip():
             return None, "Enter text to be synthesized", None, None
@@ -506,19 +677,70 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                 torch.cuda.empty_cache()
             return None, f"Error: {type(e).__name__}: {str(e)[:100]}", None, None
 
-        waveform = audio[0].squeeze(0).cpu().numpy()
-        waveform = (waveform * 32767).astype(np.int16)
+        # Start with float32 for processing chain
+        waveform = audio[0].squeeze(0).cpu().numpy().astype(np.float32)
 
-        saved_path = save_audio_with_ffmpeg(waveform, sampling_rate, output_format, "omnivoice")
+        # Track the actual sample rate of the audio data
+        current_sr = sampling_rate  # Starts at model's native rate (16kHz)
+        
+        # Apply ZipEnhancer if enabled (at 16kHz, BEFORE upsampling to 48kHz)
+        if use_zipenhancer:
+            nonlocal zipenhancer
+            if zipenhancer is None:
+                zipenhancer_dir = ensure_zipenhancer_downloaded()
+                zipenhancer = ZipEnhancerProcessor(zipenhancer_dir)
+            
+            # Save float32 to temp file for ZipEnhancer
+            temp_path = OUTPUTS_DIR / f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+            sf.write(temp_path, waveform, current_sr)
+            
+            enhanced_path = str(temp_path.with_suffix('.enhanced.wav'))
+            try:
+                enhanced_path = zipenhancer.enhance(str(temp_path), enhanced_path)
+                
+                # Read enhanced result AND its actual sample rate
+                waveform, current_sr = sf.read(enhanced_path)
+                
+                # Cleanup
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                if os.path.exists(enhanced_path):
+                    os.unlink(enhanced_path)
+                    
+                logging.info(f"ZipEnhancer output: {current_sr}Hz")
+                
+            except Exception as e:
+                logging.error(f"ZipEnhancer failed, keeping original: {e}")
+                if temp_path and os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                # waveform stays as original float32
+
+        # Apply normalization to float32 data (after ZipEnhancer if used, before int16 conversion)
+        if normalize:
+            waveform = normalize_audio(waveform, float(normalize_level))
+
+        # Convert to int16 ONLY at the very end, right before ffmpeg
+        if waveform.dtype != np.int16:
+            waveform = (waveform * 32767).astype(np.int16)
+
+        # Pass int16, actual sample rate, target sample rate and bitrate to ffmpeg
+        saved_path = save_audio_with_ffmpeg(
+            waveform, 
+            current_sr,
+            output_format, 
+            "omnivoice",
+            target_sr=target_sample_rate,
+            bitrate=bitrate
+        )
 
         # Generate spectrogram
         try:
-            spectrogram_path = save_spectrogram(waveform, sampling_rate)
+            spectrogram_path = save_spectrogram(waveform, current_sr)
         except Exception as e:
             logging.warning(f"Failed to generate spectrogram: {e}")
             spectrogram_path = None
 
-        return (sampling_rate, waveform), "Done! Saved in: " + Path(saved_path).name, saved_path, spectrogram_path
+        return (current_sr, waveform), "Done! Saved in: " + Path(saved_path).name, saved_path, spectrogram_path
 
     theme = gr.themes.Soft(font=["Inter", "Arial", "sans-serif"])
 
@@ -564,19 +786,37 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
 
     def _gen_settings():
         with gr.Accordion("⚙️ Settings", open=True):
-            sp = gr.Slider(0.5, 1.5, value=1.0, step=0.05, label="Speed")
+            sp = gr.Slider(0.5, 1.5, value=settings.get("speed", 1.0), step=0.05, label="Speed")
             du = gr.Number(value=None, label="Duration (seconds)", info="Leave blank to use speed settings")
-            ns = gr.Slider(4, 25, value=12, step=1, label="Inference Steps", info="12-16 optimal")
-            gs = gr.Slider(1.0, 4.0, value=3.0, step=0.1, label="Guidance Scale (CFG)")
-            dn = gr.Checkbox(label="Denoise", value=True)
-            pp = gr.Checkbox(label="Preprocess Prompt", value=True)
-            po = gr.Checkbox(label="Postprocess Output", value=True)
-            fmt = gr.Dropdown(
-                choices=AUDIO_FORMATS,
-                value="wav",
-                label="Output Format"
+            ns = gr.Slider(4, 25, value=settings.get("num_step", 12), step=1, label="Inference Steps", info="12-16 optimal")
+            gs = gr.Slider(1.0, 4.0, value=settings.get("guidance_scale", 3.0), step=0.1, label="Guidance Scale (CFG)")
+            dn = gr.Checkbox(label="Denoise", value=settings.get("denoise", True))
+            pp = gr.Checkbox(label="Preprocess Prompt", value=settings.get("preprocess_prompt", True))
+            po = gr.Checkbox(label="Postprocess Output", value=settings.get("postprocess_output", True))
+            
+            with gr.Row():
+                fmt = gr.Dropdown(
+                    choices=AUDIO_FORMATS,
+                    value=settings.get("output_format", "wav"),
+                    label="Output Format",
+                    scale=1
+                )
+                sr = gr.Dropdown(
+                    choices=OUTPUT_SAMPLE_RATES,
+                    value=settings.get("output_sample_rate", 48000),
+                    label="Output Sample Rate (Hz)",
+                    scale=1
+                )
+            
+            # Bitrate only shown for lossy formats
+            br = gr.Dropdown(
+                choices=BITRATE_OPTIONS,
+                value=settings.get("bitrate", 320),
+                label="Bitrate (kbps) - for MP3/OGG/AAC",
+                visible=True
             )
-        return ns, gs, sp, du, dn, pp, po, fmt
+            
+        return ns, gs, sp, du, dn, pp, po, fmt, sr, br
 
     with gr.Blocks(title="OmniVoice Portable") as demo:
         gr.Markdown("<div align='center'><h1>OmniVoice Portable</h1></div>")
@@ -613,8 +853,26 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                         vc_ref_audio = gr.Audio(label="Reference Audio", type="filepath")
                         vc_ref_text = gr.Textbox(label="Reference Text", lines=1, 
                                                   placeholder="Leave empty for automatic transcription")
-                        vc_lang = _lang_dropdown()
-                        vc_ns, vc_gs, vc_sp, vc_du, vc_dn, vc_pp, vc_po, vc_fmt = _gen_settings()
+                        vc_lang = _lang_dropdown(value=settings.get("language", "Auto"))
+                        vc_ns, vc_gs, vc_sp, vc_du, vc_dn, vc_pp, vc_po, vc_fmt, vc_sr, vc_br = _gen_settings()
+                        
+                        # Audio Processing controls
+                        with gr.Accordion("🔊 Audio Processing", open=True):
+                            vc_normalize = gr.Checkbox(
+                                label="Normalize Audio", 
+                                value=settings.get("normalize", False)
+                            )
+                            vc_norm_level = gr.Dropdown(
+                                label="Normalization Level (dB)",
+                                choices=NORMALIZATION_LEVELS,
+                                value=settings.get("normalize_level", -15),
+                                interactive=True
+                            )
+                            vc_use_zipenhancer = gr.Checkbox(
+                                label="Use ZipEnhancer (Speech Restoration)", 
+                                value=settings.get("use_zipenhancer", True),
+                                info="Enhance output audio quality using AI"
+                            )
 
                     with gr.Column(scale=1):
                         with gr.Row(elem_classes="generate-btn-row"):
@@ -680,12 +938,35 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                     outputs=[vc_ref_audio],
                 )
 
-                def _clone_fn(text, lang, ref_aud, ref_text, ns, gs, dn, sp, du, pp, po, fmt):
+                def _clone_fn(text, lang, ref_aud, ref_text, ns, gs, dn, sp, du, pp, po, fmt, sr, br,
+                             normalize, norm_level, use_zipenhancer):
+                    # Save settings before generation
+                    current_settings = {
+                        "speed": sp,
+                        "num_step": ns,
+                        "guidance_scale": gs,
+                        "denoise": dn,
+                        "preprocess_prompt": pp,
+                        "postprocess_output": po,
+                        "output_format": fmt,
+                        "output_sample_rate": sr,
+                        "bitrate": br,
+                        "language": lang,
+                        "normalize": normalize,
+                        "normalize_level": norm_level,
+                        "use_zipenhancer": use_zipenhancer,
+                    }
+                    save_settings(current_settings)
+                    
                     return _gen_core(text, lang, ref_aud, None, ns, gs, dn, sp, du, pp, po, fmt,
-                                   mode="clone", ref_text=ref_text or None)
+                                   mode="clone", ref_text=ref_text or None,
+                                   normalize=normalize, normalize_level=norm_level,
+                                   use_zipenhancer=use_zipenhancer,
+                                   target_sample_rate=sr, bitrate=br)
 
                 vc_btn.click(_clone_fn,
-                    inputs=[vc_text, vc_lang, vc_ref_audio, vc_ref_text, vc_ns, vc_gs, vc_dn, vc_sp, vc_du, vc_pp, vc_po, vc_fmt],
+                    inputs=[vc_text, vc_lang, vc_ref_audio, vc_ref_text, vc_ns, vc_gs, vc_dn, vc_sp, vc_du, vc_pp, vc_po, vc_fmt, vc_sr, vc_br,
+                           vc_normalize, vc_norm_level, vc_use_zipenhancer],
                     outputs=[vc_audio, vc_status, vc_saved_file, vc_spectrogram])
 
                 vc_restart_btn.click(
@@ -707,7 +988,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                             vd_paste_btn = gr.Button("📋 Paste", scale=1)
                             vd_copy_btn = gr.Button("📄 Copy", scale=1)
 
-                        vd_lang = _lang_dropdown()
+                        vd_lang = _lang_dropdown(value=settings.get("language", "Auto"))
 
                         with gr.Row(elem_classes="voice-controls-row"):
                             vd_voice_selector = gr.Dropdown(
@@ -727,7 +1008,25 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                         for _cat, _choices in _CATEGORIES.items():
                             vd_groups.append(gr.Dropdown(label=_cat, choices=["Auto"] + _choices, value="Auto"))
 
-                        vd_ns, vd_gs, vd_sp, vd_du, vd_dn, vd_pp, vd_po, vd_fmt = _gen_settings()
+                        vd_ns, vd_gs, vd_sp, vd_du, vd_dn, vd_pp, vd_po, vd_fmt, vd_sr, vd_br = _gen_settings()
+                        
+                        # Audio Processing controls
+                        with gr.Accordion("🔊 Audio Processing", open=True):
+                            vd_normalize = gr.Checkbox(
+                                label="Normalize Audio", 
+                                value=settings.get("normalize", True)
+                            )
+                            vd_norm_level = gr.Dropdown(
+                                label="Normalization Level (dB)",
+                                choices=NORMALIZATION_LEVELS,
+                                value=settings.get("normalize_level", -15),
+                                interactive=True
+                            )
+                            vd_use_zipenhancer = gr.Checkbox(
+                                label="Use ZipEnhancer (Speech Restoration)", 
+                                value=settings.get("use_zipenhancer", True),
+                                info="Enhance output audio quality using AI"
+                            )
 
                     with gr.Column(scale=1):
                         with gr.Row(elem_classes="generate-btn-row"):
@@ -806,16 +1105,47 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                             parts.append(v)
                     return ", ".join(parts)
 
-                def _design_fn(text, lang, ref_aud, ns, gs, dn, sp, du, pp, po, fmt, *groups):
+                def _design_fn(text, lang, ref_aud, ns, gs, dn, sp, du, pp, po, fmt, sr, br, *args):
+                    # Separate groups from audio processing args
+                    num_groups = len(vd_groups)
+                    groups = args[:num_groups]
+                    normalize = args[num_groups]
+                    norm_level = args[num_groups + 1]
+                    use_zipenhancer = args[num_groups + 2]
+                    
+                    # Save settings before generation
+                    current_settings = {
+                        "speed": sp,
+                        "num_step": ns,
+                        "guidance_scale": gs,
+                        "denoise": dn,
+                        "preprocess_prompt": pp,
+                        "postprocess_output": po,
+                        "output_format": fmt,
+                        "output_sample_rate": sr,
+                        "bitrate": br,
+                        "language": lang,
+                        "normalize": normalize,
+                        "normalize_level": norm_level,
+                        "use_zipenhancer": use_zipenhancer,
+                    }
+                    save_settings(current_settings)
+                    
                     if ref_aud:
                         return _gen_core(text, lang, ref_aud, None, ns, gs, dn, sp, du, pp, po, fmt,
-                                       mode="clone", ref_text=None)
+                                       mode="clone", ref_text=None,
+                                       normalize=normalize, normalize_level=norm_level,
+                                       use_zipenhancer=use_zipenhancer,
+                                       target_sample_rate=sr, bitrate=br)
                     else:
                         return _gen_core(text, lang, None, _build_instruct(groups), ns, gs, dn, sp, du, pp, po, fmt, 
-                                       mode="design")
+                                       mode="design",
+                                       normalize=normalize, normalize_level=norm_level,
+                                       use_zipenhancer=use_zipenhancer,
+                                       target_sample_rate=sr, bitrate=br)
 
                 vd_btn.click(_design_fn,
-                    inputs=[vd_text, vd_lang, vd_ref_audio, vd_ns, vd_gs, vd_dn, vd_sp, vc_du, vd_pp, vd_po, vd_fmt] + vd_groups,
+                    inputs=[vd_text, vd_lang, vd_ref_audio, vd_ns, vd_gs, vd_dn, vd_sp, vc_du, vd_pp, vd_po, vd_fmt, vd_sr, vd_br] + vd_groups + [vd_normalize, vd_norm_level, vd_use_zipenhancer],
                     outputs=[vd_audio, vd_status, vd_saved_file, vd_spectrogram])
 
                 vd_restart_btn.click(

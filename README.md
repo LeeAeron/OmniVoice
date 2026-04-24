@@ -50,6 +50,9 @@ This project provided with only *.bat installer/re-installer/starter/updater fil
 - support for change output file format: wav/mp3/aac/m4a/m4b/ogg/flac/opus changeable audio files (with own local FFMPEG in OmniVoice folder)
 - auto-saving synthezed output file into local 'outputs' folder (in project folder)
 - additional Copy/Paste/Clear buttons for 'Text to synteze' (works with clipboard)
+- enhance speech quiality with ZipEnhancer model
+- normalization with dB level setting
+- output audio settings: samplerate and bitrate (for lossy formats)
 
 
 ## 📺 Credits
