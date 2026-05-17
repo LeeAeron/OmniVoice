@@ -15,9 +15,13 @@ import time
 import json
 import warnings
 import random
+import hashlib
+import pickle
+import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple, Iterator, Optional
 
 
 os.environ["HF_HUB_OFFLINE"] = "0"
@@ -51,10 +55,12 @@ OUTPUTS_DIR = CWD / "outputs"
 REFERENCE_AUDIO_DIR = CWD / "reference_audio"
 MODELS_DIR = CWD / "models"
 SETTINGS_FILE = CWD / "settings.txt"
+CHECKPOINT_DIR = CWD / "checkpoints"
 
 OUTPUTS_DIR.mkdir(exist_ok=True)
 REFERENCE_AUDIO_DIR.mkdir(exist_ok=True)
 MODELS_DIR.mkdir(exist_ok=True)
+CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 # SETTING UP THE HF HUB CACHE
 os.environ["HF_HOME"] = str(MODELS_DIR / "hf_cache")
@@ -67,6 +73,7 @@ logging.info(f"Outputs will be saved to: {OUTPUTS_DIR}")
 logging.info(f"Reference voices folder: {REFERENCE_AUDIO_DIR}")
 logging.info(f"Models folder: {MODELS_DIR}")
 logging.info(f"HF Cache: {MODELS_DIR / 'hf_cache'}")
+logging.info(f"Checkpoints folder: {CHECKPOINT_DIR}")
 logging.getLogger("modelscope").setLevel(logging.ERROR)
 
 from huggingface_hub import constants as hf_constants
@@ -99,6 +106,21 @@ BITRATE_OPTIONS = [64, 96, 128, 160, 192, 224, 256, 320]
 # Output sample rate options
 OUTPUT_SAMPLE_RATES = [24000, 32000, 44100, 48000]
 
+# Chunking modes
+CHUNKING_MODES = ["lines", "sentences", "characters"]
+
+# Crossfade range (ms)
+CROSSFADE_MS_RANGE = [0, 10, 20, 30, 40, 50, 60, 80, 100, 150, 200]
+
+# Max lines per chunk options
+MAX_LINES_OPTIONS = list(range(1, 21))
+
+# Max sentences per chunk options
+MAX_SENTENCES_OPTIONS = list(range(1, 21))
+
+# Max chars per chunk options
+MAX_CHARS_OPTIONS = list(range(100, 3001, 50))
+
 
 def get_best_device():
     if torch.cuda.is_available():
@@ -128,9 +150,7 @@ def save_audio_with_ffmpeg(waveform: np.ndarray, sample_rate: int, fmt: str = "w
         if fmt == "mp3":
             cmd.extend(["-c:a", "libmp3lame", "-b:a", f"{bitrate}k"])
         elif fmt == "ogg":
-            cmd.extend(["-c:a", "libvorbis", "-q:a", "4"])  # Vorbis uses quality, not bitrate directly
-            # Alternative: use opus for better quality control
-            # cmd.extend(["-c:a", "libopus", "-b:a", f"{bitrate}k"])
+            cmd.extend(["-c:a", "libvorbis", "-q:a", "4"])
         elif fmt == "m4a" or fmt == "aac":
             cmd.extend(["-c:a", "aac", "-b:a", f"{bitrate}k"])
         elif fmt == "flac":
@@ -404,6 +424,545 @@ class ZipEnhancerProcessor:
             return audio_path
 
 
+# Chunking system
+# Sentence splitting regex - matches sentence endings: . ! ? ... (with optional closing quotes/brackets)
+_sentence_end_re = re.compile(r"[.!?]+['\"\)\]]*\s+|[.!?]+['\"\)\]]*$", re.MULTILINE)
+
+
+def split_into_sentences(text: str) -> List[str]:
+    """Split text into sentences, preserving sentence delimiters."""
+    if not text.strip():
+        return []
+    parts = _sentence_end_re.split(text)
+    sentences = [s.strip() for s in parts if s.strip()]
+    return sentences
+
+
+@dataclass
+class ScriptChunk:
+    """Represents a single chunk of text for generation."""
+    text: str
+    start_idx: int
+    end_idx: int
+    is_first: bool
+    is_last: bool
+    estimated_duration_sec: float = 0.0
+
+
+class ScriptChunker:
+    """Splits long text into adaptively sized chunks.
+
+    Supports three chunking modes:
+    - "lines": chunk by number of lines
+    - "sentences": chunk by number of sentences (detects . ! ? ... endings)
+    - "characters": chunk by character count
+    """
+
+    def __init__(
+        self,
+        chunking_mode: str = "lines",
+        max_lines_per_chunk: int = 8,
+        max_sentences_per_chunk: int = 5,
+        max_chars_per_chunk: int = 800,
+        max_tokens_estimate: int = 1500,
+        chars_per_token: float = 3.5,
+        avg_words_per_minute: float = 150.0,
+    ):
+        self.chunking_mode = chunking_mode
+        self.max_lines = max_lines_per_chunk
+        self.max_sentences = max_sentences_per_chunk
+        self.max_chars = max_chars_per_chunk
+        self.max_tokens = max_tokens_estimate
+        self.chars_per_token = chars_per_token
+        self.wpm = avg_words_per_minute
+
+    def _estimate_tokens(self, text: str) -> int:
+        return int(len(text) / self.chars_per_token)
+
+    def _estimate_duration(self, text: str) -> float:
+        words = len(text.split())
+        return (words / self.wpm) * 60.0
+
+    def _chunk_by_lines(self, lines: List[str]) -> List[ScriptChunk]:
+        """Original line-based chunking."""
+        if not lines:
+            return []
+
+        chunks = []
+        start_idx = 0
+
+        while start_idx < len(lines):
+            end_idx = start_idx + 1
+            current_chars = len(lines[start_idx])
+            current_tokens = self._estimate_tokens(lines[start_idx])
+
+            while (end_idx < len(lines) and 
+                   end_idx - start_idx < self.max_lines and
+                   current_tokens < self.max_tokens and
+                   current_chars < self.max_chars):
+
+                next_line = lines[end_idx]
+                next_tokens = self._estimate_tokens(next_line)
+
+                if current_tokens + next_tokens > self.max_tokens * 1.1:
+                    break
+
+                current_chars += len(next_line)
+                current_tokens += next_tokens
+                end_idx += 1
+
+            chunk_text = "\n".join(lines[start_idx:end_idx])
+            est_duration = self._estimate_duration(chunk_text)
+
+            chunks.append(ScriptChunk(
+                text=chunk_text,
+                start_idx=start_idx,
+                end_idx=end_idx - 1,
+                is_first=(start_idx == 0),
+                is_last=(end_idx >= len(lines)),
+                estimated_duration_sec=est_duration
+            ))
+
+            start_idx = end_idx
+
+        return chunks
+
+    def _chunk_by_sentences(self, text: str) -> List[ScriptChunk]:
+        """Chunk by number of sentences."""
+        sentences = split_into_sentences(text)
+        if not sentences:
+            return []
+
+        chunks = []
+        current_sentences = []
+        current_chars = 0
+        current_tokens = 0
+        start_idx = 0
+        sent_idx = 0
+
+        for sentence in sentences:
+            sent_chars = len(sentence)
+            sent_tokens = self._estimate_tokens(sentence)
+
+            would_exceed = (
+                len(current_sentences) >= self.max_sentences or
+                current_chars + sent_chars > self.max_chars or
+                current_tokens + sent_tokens > self.max_tokens
+            )
+
+            if would_exceed and current_sentences:
+                chunk_text = " ".join(current_sentences)
+                chunks.append(ScriptChunk(
+                    text=chunk_text,
+                    start_idx=start_idx,
+                    end_idx=sent_idx - 1,
+                    is_first=(start_idx == 0),
+                    is_last=False,
+                    estimated_duration_sec=self._estimate_duration(chunk_text)
+                ))
+                start_idx = sent_idx
+                current_sentences = [sentence]
+                current_chars = sent_chars
+                current_tokens = sent_tokens
+            else:
+                current_sentences.append(sentence)
+                current_chars += sent_chars
+                current_tokens += sent_tokens
+
+            sent_idx += 1
+
+        if current_sentences:
+            chunk_text = " ".join(current_sentences)
+            chunks.append(ScriptChunk(
+                text=chunk_text,
+                start_idx=start_idx,
+                end_idx=sent_idx - 1,
+                is_first=(start_idx == 0),
+                is_last=True,
+                estimated_duration_sec=self._estimate_duration(chunk_text)
+            ))
+
+        return chunks
+
+    def _chunk_by_characters(self, text: str) -> List[ScriptChunk]:
+        """Chunk by total character count."""
+        if not text:
+            return []
+
+        chunks = []
+        current_text = ""
+        current_chars = 0
+        start_idx = 0
+        char_idx = 0
+
+        for char in text:
+            char_idx += 1
+            current_text += char
+            current_chars += 1
+
+            would_exceed = current_chars >= self.max_chars
+
+            if would_exceed and current_text.strip():
+                chunks.append(ScriptChunk(
+                    text=current_text.strip(),
+                    start_idx=start_idx,
+                    end_idx=char_idx - 1,
+                    is_first=(start_idx == 0),
+                    is_last=False,
+                    estimated_duration_sec=self._estimate_duration(current_text)
+                ))
+                start_idx = char_idx
+                current_text = ""
+                current_chars = 0
+
+        if current_text.strip():
+            chunks.append(ScriptChunk(
+                text=current_text.strip(),
+                start_idx=start_idx,
+                end_idx=char_idx,
+                is_first=(start_idx == 0),
+                is_last=True,
+                estimated_duration_sec=self._estimate_duration(current_text)
+            ))
+
+        return chunks
+
+    def parse_text(self, text: str) -> List[ScriptChunk]:
+        """Parse text into chunks using the configured chunking mode."""
+        if not text or not text.strip():
+            return []
+
+        if self.chunking_mode == "sentences":
+            return self._chunk_by_sentences(text)
+        elif self.chunking_mode == "characters":
+            return self._chunk_by_characters(text)
+        else:  # "lines" (default)
+            lines = [l for l in text.strip().split("\n") if l.strip()]
+            return self._chunk_by_lines(lines)
+
+
+class AudioCrossfader:
+    """Smooth gluing of audio chunks with cosine crossfade."""
+
+    def __init__(self, fade_duration_ms: float = 50.0, sample_rate: int = 24000):
+        self.fade_samples = max(1, int(sample_rate * (fade_duration_ms / 1000.0)))
+        self.sample_rate = sample_rate
+
+    def apply_crossfade(self, chunk1: np.ndarray, chunk2: np.ndarray) -> np.ndarray:
+        if len(chunk1) < self.fade_samples * 2 or len(chunk2) < self.fade_samples * 2:
+            return np.concatenate([chunk1, chunk2])
+
+        fade_out = chunk1[-self.fade_samples:]
+        fade_in = chunk2[:self.fade_samples]
+
+        t = np.linspace(0, 1, self.fade_samples)
+        curve_out = np.cos(t * np.pi / 2)
+        curve_in = np.sin(t * np.pi / 2)
+
+        mixed = fade_out * curve_out + fade_in * curve_in
+
+        result = np.concatenate([
+            chunk1[:-self.fade_samples],
+            mixed,
+            chunk2[self.fade_samples:]
+        ])
+
+        return result
+
+    def concatenate_chunks(self, chunks: List[np.ndarray]) -> np.ndarray:
+        if not chunks:
+            return np.array([])
+        if len(chunks) == 1:
+            return chunks[0]
+
+        result = chunks[0]
+        for next_chunk in chunks[1:]:
+            result = self.apply_crossfade(result, next_chunk)
+
+        return result
+
+
+@dataclass
+class GenerationCheckpoint:
+    """Save point to resume generation."""
+    session_id: str
+    text_hash: str
+    mode: str  # "clone" or "design"
+    language: str
+    num_step: int
+    guidance_scale: float
+    denoise: bool
+    preprocess_prompt: bool
+    postprocess_output: bool
+    speed: float
+    duration: float
+    seed: int
+    # state
+    total_chunks: int
+    completed_chunks: int
+    chunk_audio_files: List[str]
+    timestamp: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "text_hash": self.text_hash,
+            "mode": self.mode,
+            "language": self.language,
+            "num_step": self.num_step,
+            "guidance_scale": self.guidance_scale,
+            "denoise": self.denoise,
+            "preprocess_prompt": self.preprocess_prompt,
+            "postprocess_output": self.postprocess_output,
+            "speed": self.speed,
+            "duration": self.duration,
+            "seed": self.seed,
+            "total_chunks": self.total_chunks,
+            "completed_chunks": self.completed_chunks,
+            "chunk_audio_files": self.chunk_audio_files,
+            "timestamp": self.timestamp,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "GenerationCheckpoint":
+        return cls(**data)
+
+
+class CheckpointManager:
+    """Controls saving and loading checkpoints."""
+
+    def __init__(self, checkpoint_dir: Path = CHECKPOINT_DIR):
+        self.checkpoint_dir = checkpoint_dir
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    def _get_checkpoint_path(self, session_id: str) -> Path:
+        return self.checkpoint_dir / f"checkpoint_{session_id}.pkl"
+
+    def save(self, checkpoint: GenerationCheckpoint):
+        path = self._get_checkpoint_path(checkpoint.session_id)
+        with open(path, 'wb') as f:
+            pickle.dump(checkpoint.to_dict(), f)
+        logging.info(f"[Checkpoint] Saved: {path} ({checkpoint.completed_chunks}/{checkpoint.total_chunks} chunks)")
+
+    def load(self, session_id: str) -> Optional[GenerationCheckpoint]:
+        path = self._get_checkpoint_path(session_id)
+        if not path.exists():
+            return None
+        try:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+            ckpt = GenerationCheckpoint.from_dict(data)
+            logging.info(f"[Checkpoint] Loaded: {session_id} ({ckpt.completed_chunks}/{ckpt.total_chunks} chunks)")
+            return ckpt
+        except Exception as e:
+            logging.error(f"[Checkpoint] Failed to load: {e}")
+            return None
+
+    def delete(self, session_id: str):
+        path = self._get_checkpoint_path(session_id)
+        if path.exists():
+            os.remove(path)
+            logging.info(f"[Checkpoint] Deleted: {session_id}")
+
+    def list_available(self) -> List[Tuple[str, int, int, float]]:
+        """Returns a list (session_id, completed, total, timestamp)."""
+        available = []
+        for fname in os.listdir(self.checkpoint_dir):
+            if fname.startswith("checkpoint_") and fname.endswith(".pkl"):
+                try:
+                    with open(self.checkpoint_dir / fname, 'rb') as f:
+                        data = pickle.load(f)
+                    sid = data["session_id"]
+                    available.append((sid, data["completed_chunks"], data["total_chunks"], data["timestamp"]))
+                except:
+                    continue
+        return sorted(available, key=lambda x: x[3], reverse=True)
+
+    def generate_session_id(self, text: str, mode: str, seed: int) -> str:
+        """Generates a unique session ID based on parameters."""
+        effective_seed = seed if seed >= 0 else 0
+        content = f"{text}:{mode}:{effective_seed}"
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+
+class ProgressTracker:
+    """Tracks progress and calculates ETA."""
+
+    def __init__(self, total_chunks: int):
+        self.total = total_chunks
+        self.completed = 0
+        self.chunk_times: List[float] = []
+        self.start_time = time.time()
+        self.current_chunk_start = 0.0
+
+    def start_chunk(self):
+        self.current_chunk_start = time.time()
+
+    def finish_chunk(self):
+        elapsed = time.time() - self.current_chunk_start
+        self.chunk_times.append(elapsed)
+        self.completed += 1
+
+    def get_eta_seconds(self) -> float:
+        if not self.chunk_times:
+            return 0.0
+        avg_time = sum(self.chunk_times) / len(self.chunk_times)
+        remaining = self.total - self.completed
+        return avg_time * remaining
+
+    def get_progress_percent(self) -> float:
+        if self.total == 0:
+            return 100.0
+        return (self.completed / self.total) * 100.0
+
+    def get_stats(self) -> str:
+        elapsed = time.time() - self.start_time
+        eta = self.get_eta_seconds()
+        pct = self.get_progress_percent()
+
+        elapsed_str = self._format_time(elapsed)
+        eta_str = self._format_time(eta)
+
+        if self.chunk_times:
+            avg_chunk = sum(self.chunk_times) / len(self.chunk_times)
+            avg_str = f"{avg_chunk:.1f}s/chunk"
+        else:
+            avg_str = "calculating..."
+
+        bar_len = 20
+        filled = int(bar_len * pct / 100)
+        bar = "█" * filled + "░" * (bar_len - filled)
+
+        return f"[{bar}] {pct:.0f}% | {self.completed}/{self.total} chunks | Elapsed: {elapsed_str} | ETA: {eta_str} | {avg_str}"
+
+    def _format_time(self, seconds: float) -> str:
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        elif seconds < 3600:
+            return f"{seconds/60:.1f}m"
+        else:
+            return f"{seconds/3600:.1f}h"
+
+
+def generate_progress_html(progress_tracker: ProgressTracker, current_chunk: int = None) -> str:
+    """Generates HTML progress bar in unified dark-purple theme."""
+    pct = progress_tracker.get_progress_percent()
+    stats = progress_tracker.get_stats()
+
+    gradient = "linear-gradient(90deg, #667eea 0%, #764ba2 100%)"
+    bg_dark = "#0f172a"
+    bg_card = "#1e293b"
+    border_color = "#334155"
+    text_primary = "#e2e8f0"
+    text_secondary = "#94a3b8"
+    accent = "#667eea"
+
+    if pct >= 100:
+        status_color = "#10b981"
+        status_icon = "✅"
+    elif pct > 0:
+        status_color = accent
+        status_icon = "🔄"
+    else:
+        status_color = "#64748b"
+        status_icon = "⏳"
+
+    chunk_indicator = ""
+    if current_chunk is not None and progress_tracker.total > 1:
+        chunk_indicator = f'<span style="color:{accent}; font-size:13px; font-weight:600;">{status_icon} Chunk {current_chunk}/{progress_tracker.total}</span>'
+
+    html = f"""
+    <div style="width:100%; background:{bg_dark}; border-radius:12px; padding:16px; margin:8px 0; 
+                border:1px solid {border_color}; font-family:'Segoe UI',system-ui,sans-serif;
+                box-shadow:0 4px 6px rgba(0,0,0,0.3);">
+        <div style="display:flex; justify-content:space-between; margin-bottom:10px; align-items:center;">
+            <span style="color:{text_primary}; font-size:14px; font-weight:600;">🎙️ Generation Progress</span>
+            <div style="display:flex; gap:12px; align-items:center;">
+                {chunk_indicator}
+                <span style="color:{text_secondary}; font-size:13px;">{pct:.0f}% complete</span>
+            </div>
+        </div>
+        <div style="width:100%; height:24px; background:{bg_card}; border-radius:12px; overflow:hidden;
+                    box-shadow:inset 0 2px 4px rgba(0,0,0,0.3);">
+            <div style="width:{pct}%; height:100%; background:{gradient}; 
+                        transition:width 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+                        border-radius:12px; position:relative;">
+                <div style="position:absolute; right:0; top:0; bottom:0; width:30px; 
+                            background:linear-gradient(90deg, transparent, rgba(255,255,255,0.3));"></div>
+            </div>
+        </div>
+        <div style="display:flex; justify-content:space-between; margin-top:8px; flex-wrap:wrap; gap:8px;">
+            <span style="color:{text_secondary}; font-size:12px; font-family:monospace;">{stats}</span>
+            <span style="color:{status_color}; font-size:12px; font-weight:600;">
+                {status_icon} {"Complete" if pct >= 100 else "In Progress" if pct > 0 else "Waiting"}
+            </span>
+        </div>
+    </div>
+    """
+    return html
+
+
+def generate_resume_html(checkpoints: List[Tuple[str, int, int, float]]) -> str:
+    """Generates HTML list of available checkpoints in unified theme."""
+    if not checkpoints:
+        return "<div style='color:#64748b; padding:8px;'>No saved checkpoints found</div>"
+
+    bg_card = "#1e293b"
+    border_color = "#334155"
+    text_primary = "#e2e8f0"
+    text_secondary = "#94a3b8"
+    accent = "#667eea"
+
+    html = f"<div style='max-height:200px; overflow-y:auto;'>"
+    for sid, completed, total, ts in checkpoints:
+        pct = (completed / total * 100) if total > 0 else 0
+        date = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        progress_gradient = f"linear-gradient(90deg, rgba(102,126,234,0.3) {pct}%, transparent {pct}%)"
+
+        html += f"""
+        <div style="display:flex; justify-content:space-between; align-items:center; 
+                    padding:8px 12px; margin:4px 0; background:{progress_gradient}, {bg_card}; 
+                    border-radius:8px; border:1px solid {border_color}; cursor:pointer;
+                    transition:all 0.2s ease;" 
+             onmouseover="this.style.borderColor='{accent}'; this.style.transform='translateX(4px)'" 
+             onmouseout="this.style.borderColor='{border_color}'; this.style.transform='translateX(0)'">
+            <div>
+                <div style="color:{text_primary}; font-size:13px;">Session {sid[:8]}...</div>
+                <div style="color:{text_secondary}; font-size:11px;">{date} | {completed}/{total} chunks ({pct:.0f}%)</div>
+            </div>
+            <div style="color:{accent}; font-size:12px; font-weight:600;">RESUME →</div>
+        </div>
+        """
+    html += "</div>"
+    return html
+
+
+def cleanup_checkpoints_folder():
+    """Remove all files from checkpoints folder."""
+    try:
+        if not os.path.exists(CHECKPOINT_DIR):
+            os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+            return 0
+        removed = 0
+        for item in os.listdir(CHECKPOINT_DIR):
+            item_path = os.path.join(CHECKPOINT_DIR, item)
+            try:
+                if os.path.isfile(item_path):
+                    os.remove(item_path)
+                    removed += 1
+                elif os.path.isdir(item_path):
+                    import shutil
+                    shutil.rmtree(item_path)
+                    removed += 1
+            except Exception as e:
+                logging.warning(f"[CheckpointCleanup] Failed to delete {item}: {e}")
+        logging.info(f"[CheckpointCleanup] Cleared {removed} items from {CHECKPOINT_DIR}")
+        return removed
+    except Exception as e:
+        logging.error(f"[CheckpointCleanup] Error: {e}")
+        return 0
+
+
 # SETTINGS MANAGEMENT
 
 def load_settings() -> Dict[str, Any]:
@@ -424,6 +983,13 @@ def load_settings() -> Dict[str, Any]:
         "language": "Auto",
         "seed": -1,
         "random_seed": True,
+        # Chunking settings
+        "enable_chunking": True,
+        "chunking_mode": "lines",
+        "max_lines_per_chunk": 8,
+        "max_sentences_per_chunk": 5,
+        "max_chars_per_chunk": 800,
+        "crossfade_ms": 50,
     }
 
     if not SETTINGS_FILE.exists():
@@ -613,6 +1179,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=None)
     parser.add_argument("--ip", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--find-port", action="store_true", default=False,
+                        help="Auto-find available port if default is taken")
     parser.add_argument("--root-path", default=None)
     parser.add_argument("--share", action="store_true", default=False)
     parser.add_argument("--no-browser", action="store_true", default=False,
@@ -629,6 +1197,9 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
 
     # Initialize ZipEnhancer if needed (lazy load on first use)
     zipenhancer = None
+
+    # Initialize checkpoint manager
+    checkpoint_mgr = CheckpointManager()
 
     def _set_seed(seed_value: int):
         """Set PyTorch random seed for reproducible generation."""
@@ -652,20 +1223,23 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
             logging.info(f"Random seed used: {seed}")
             return seed
 
-    def _gen_core(text, language, ref_audio, instruct, num_step, guidance_scale, 
-                  denoise, speed, duration, preprocess_prompt, postprocess_output, 
-                  output_format, mode, ref_text=None,
-                  normalize=True, normalize_level=-20, use_zipenhancer=True,
-                  target_sample_rate=48000, bitrate=320, seed=-1, random_seed=True):
-
-        if not text or not text.strip():
-            return None, "Enter text to be synthesized", None, None
-
-        # Set seed before generation
-        if random_seed:
-            actual_seed = _set_seed(-1)
-        else:
-            actual_seed = _set_seed(seed)
+    def _generate_single_chunk(
+        model_instance: FullOffloadOmniVoice,
+        text: str,
+        language: str,
+        ref_audio,
+        instruct: str,
+        num_step: int,
+        guidance_scale: float,
+        denoise: bool,
+        speed: float,
+        duration: float,
+        preprocess_prompt: bool,
+        postprocess_output: bool,
+        mode: str,
+        ref_text: str = None,
+    ) -> np.ndarray:
+        """Generate audio for a single text chunk."""
 
         effective_steps = min(int(num_step or 12), 25)
 
@@ -689,72 +1263,73 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
             kw["duration"] = float(duration)
 
         if mode == "clone":
-            if not ref_audio:
-                return None, "Upload reference audio", None, None
-            kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-            )
+            if ref_audio:
+                kw["voice_clone_prompt"] = model_instance.create_voice_clone_prompt(
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                )
 
         if mode == "design":
             if instruct and instruct.strip():
                 kw["instruct"] = instruct.strip()
 
         try:
-            audio = model.generate(**kw)
+            audio = model_instance.generate(**kw)
+            waveform = audio[0].squeeze(0).cpu().numpy().astype(np.float32)
+            return waveform
         except Exception as e:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            return None, f"Error: {type(e).__name__}: {str(e)[:100]}", None, None
+            raise e
 
-        # Start with float32 for processing chain
-        waveform = audio[0].squeeze(0).cpu().numpy().astype(np.float32)
+    def _postprocess_audio(
+        waveform: np.ndarray,
+        current_sr: int,
+        normalize: bool,
+        normalize_level: float,
+        use_zipenhancer: bool,
+        target_sample_rate: int,
+        bitrate: int,
+        output_format: str,
+    ) -> Tuple[np.ndarray, int, str, str]:
+        """Apply post-processing: ZipEnhancer, normalization, save to file."""
+        nonlocal zipenhancer
 
-        # Track the actual sample rate of the audio data
-        current_sr = sampling_rate  # Starts at model's native rate (16kHz)
-
-        # Apply ZipEnhancer if enabled (at 16kHz, BEFORE upsampling to 48kHz)
+        # Apply ZipEnhancer if enabled (at 16kHz, BEFORE upsampling)
         if use_zipenhancer:
-            nonlocal zipenhancer
             if zipenhancer is None:
                 zipenhancer_dir = ensure_zipenhancer_downloaded()
                 zipenhancer = ZipEnhancerProcessor(zipenhancer_dir)
 
-            # Save float32 to temp file for ZipEnhancer
             temp_path = OUTPUTS_DIR / f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
             sf.write(temp_path, waveform, current_sr)
 
             enhanced_path = str(temp_path.with_suffix('.enhanced.wav'))
             try:
                 enhanced_path = zipenhancer.enhance(str(temp_path), enhanced_path)
-
-                # Read enhanced result AND its actual sample rate
                 waveform, current_sr = sf.read(enhanced_path)
 
-                # Cleanup
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
                 if os.path.exists(enhanced_path):
                     os.unlink(enhanced_path)
 
                 logging.info(f"ZipEnhancer output: {current_sr}Hz")
-
             except Exception as e:
                 logging.error(f"ZipEnhancer failed, keeping original: {e}")
                 if temp_path and os.path.exists(temp_path):
                     os.unlink(temp_path)
-                # waveform stays as original float32
 
-        # Apply normalization to float32 data (after ZipEnhancer if used, before int16 conversion)
+        # Apply normalization
         if normalize:
             waveform = normalize_audio(waveform, float(normalize_level))
 
-        # Convert to int16 ONLY at the very end, right before ffmpeg
+        # Convert to int16 for ffmpeg
         if waveform.dtype != np.int16:
             waveform = (waveform * 32767).astype(np.int16)
 
-        # Pass int16, actual sample rate, target sample rate and bitrate to ffmpeg
+        # Save via ffmpeg
         saved_path = save_audio_with_ffmpeg(
             waveform, 
             current_sr,
@@ -771,13 +1346,291 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
             logging.warning(f"Failed to generate spectrogram: {e}")
             spectrogram_path = None
 
-        status_msg = f"Done! Saved in: {Path(saved_path).name} | Seed: {actual_seed}"
-        return (current_sr, waveform), status_msg, saved_path, spectrogram_path
+        return waveform, current_sr, saved_path, spectrogram_path
 
-    theme = gr.themes.Soft(font=["Inter", "Arial", "sans-serif"])
+    def _gen_core_chunked(
+        text, language, ref_audio, instruct, num_step, guidance_scale, 
+        denoise, speed, duration, preprocess_prompt, postprocess_output, 
+        output_format, mode, ref_text=None,
+        normalize=True, normalize_level=-20, use_zipenhancer=True,
+        target_sample_rate=48000, bitrate=320, seed=-1, random_seed=True,
+        # Chunking parameters
+        enable_chunking=True,
+        chunking_mode="lines",
+        max_lines_per_chunk=8,
+        max_sentences_per_chunk=5,
+        max_chars_per_chunk=800,
+        crossfade_ms=50,
+    ) -> Iterator[tuple]:
+        """Chunked generation with progress tracking and resume support."""
+
+        if not text or not text.strip():
+            yield None, "Enter text to be synthesized", None, None, ""
+            return
+
+        # Set seed before generation
+        if random_seed:
+            actual_seed = _set_seed(-1)
+        else:
+            actual_seed = _set_seed(seed)
+
+        # Check if chunking should be used
+        should_chunk = False
+        if enable_chunking:
+            if chunking_mode == "lines":
+                total_lines = len([l for l in text.strip().split("\n") if l.strip()])
+                should_chunk = total_lines > max_lines_per_chunk
+            elif chunking_mode == "sentences":
+                total_sentences = len(split_into_sentences(text))
+                should_chunk = total_sentences > max_sentences_per_chunk
+            elif chunking_mode == "characters":
+                total_chars = len(text.strip())
+                should_chunk = total_chars > max_chars_per_chunk
+
+        # Single-pass generation (no chunking needed)
+        if not should_chunk:
+            try:
+                waveform = _generate_single_chunk(
+                    model, text, language, ref_audio, instruct,
+                    num_step, guidance_scale, denoise, speed, duration,
+                    preprocess_prompt, postprocess_output, mode, ref_text
+                )
+
+                current_sr = sampling_rate  # Model native rate
+
+                # Post-process
+                waveform, current_sr, saved_path, spectrogram_path = _postprocess_audio(
+                    waveform, current_sr, normalize, normalize_level,
+                    use_zipenhancer, target_sample_rate, bitrate, output_format
+                )
+
+                status_msg = f"Done! Saved in: {Path(saved_path).name} | Seed: {actual_seed}"
+                yield (current_sr, waveform), status_msg, saved_path, spectrogram_path, ""
+
+            except Exception as e:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                yield None, f"Error: {type(e).__name__}: {str(e)[:100]}", None, None, ""
+            return
+
+        # CHUNKED GENERATION
+        chunker = ScriptChunker(
+            chunking_mode=chunking_mode,
+            max_lines_per_chunk=max_lines_per_chunk,
+            max_sentences_per_chunk=max_sentences_per_chunk,
+            max_chars_per_chunk=max_chars_per_chunk,
+        )
+        crossfader = AudioCrossfader(fade_duration_ms=crossfade_ms, sample_rate=sampling_rate)
+
+        chunks = chunker.parse_text(text)
+        total_chunks = len(chunks)
+
+        if total_chunks == 0:
+            yield None, "Error: Could not parse text into chunks", None, None, ""
+            return
+
+        # Initialize checkpoint for this session (internal, not exposed in UI)
+        session_id = checkpoint_mgr.generate_session_id(text, mode, actual_seed)
+        ckpt = GenerationCheckpoint(
+            session_id=session_id,
+            text_hash=hashlib.md5(text.encode()).hexdigest(),
+            mode=mode,
+            language=language,
+            num_step=num_step,
+            guidance_scale=guidance_scale,
+            denoise=denoise,
+            preprocess_prompt=preprocess_prompt,
+            postprocess_output=postprocess_output,
+            speed=speed,
+            duration=duration,
+            seed=actual_seed,
+            total_chunks=total_chunks,
+            completed_chunks=0,
+            chunk_audio_files=[],
+        )
+
+        start_idx = 0
+        all_chunk_audios = []
+
+        # Progress tracker
+        progress = ProgressTracker(total_chunks)
+
+        status_msg = f"📦 Chunked generation: {total_chunks} chunks"
+        progress_html = generate_progress_html(progress)
+        yield None, status_msg, None, None, progress_html
+
+        # Generate all chunks
+        accumulated_audio = None
+
+        for i, chunk in enumerate(chunks):
+            chunk_idx = i
+            progress.start_chunk()
+
+            # Show "processing" status with progress BEFORE blocking call
+            chunk_status = f"🔄 Processing chunk {chunk_idx + 1}/{total_chunks}..."
+            progress_html = generate_progress_html(progress, chunk_idx + 1)
+            yield None, chunk_status, None, None, progress_html
+            time.sleep(0.05)  # Let Gradio render the update
+
+            try:
+                chunk_waveform = _generate_single_chunk(
+                    model, chunk.text, language, ref_audio, instruct,
+                    num_step, guidance_scale, denoise, speed, duration,
+                    preprocess_prompt, postprocess_output, mode, ref_text
+                )
+            except Exception as e:
+                logging.error(f"[Chunk {chunk_idx + 1}] Error: {e}")
+                progress.finish_chunk()  # Count as completed (failed)
+                chunk_status = f"❌ Chunk {chunk_idx + 1} failed: {e}"
+                progress_html = generate_progress_html(progress, chunk_idx + 1)
+                yield None, chunk_status, None, None, progress_html
+                continue
+
+            if chunk_waveform is None or len(chunk_waveform) == 0:
+                progress.finish_chunk()  # Count as completed (empty)
+                chunk_status = f"⚠️ Chunk {chunk_idx + 1} produced no audio"
+                progress_html = generate_progress_html(progress, chunk_idx + 1)
+                yield None, chunk_status, None, None, progress_html
+                continue
+
+            # Save chunk for resume
+            chunk_filename = f"chunk_{session_id}_{chunk_idx:04d}.wav"
+            chunk_path = CHECKPOINT_DIR / chunk_filename
+            sf.write(chunk_path, chunk_waveform, sampling_rate, subtype='PCM_16')
+
+            all_chunk_audios.append(chunk_waveform)
+            ckpt.chunk_audio_files.append(str(chunk_path))
+            ckpt.completed_chunks = len(all_chunk_audios)
+            checkpoint_mgr.save(ckpt)
+
+            progress.finish_chunk()
+
+            # Incremental accumulation with crossfade
+            chunk_float = chunk_waveform.astype(np.float32) if chunk_waveform.dtype != np.float32 else chunk_waveform
+            if accumulated_audio is None:
+                accumulated_audio = chunk_float
+            else:
+                accumulated_audio = crossfader.apply_crossfade(accumulated_audio, chunk_float)
+
+            progress_html = generate_progress_html(progress, chunk_idx + 1)
+            chunk_status = f"✅ Chunk {chunk_idx + 1}/{total_chunks}: {len(chunk_waveform)/sampling_rate:.1f}s | Total: {len(accumulated_audio)/sampling_rate:.1f}s"
+
+            # Stream intermediate result
+            audio_16bit = (np.clip(accumulated_audio, -1.0, 1.0) * 32767).astype(np.int16)
+            yield (sampling_rate, audio_16bit), chunk_status, None, None, progress_html
+            time.sleep(0.05)  # Let Gradio render the update
+
+        # Final assembly
+        if not all_chunk_audios or accumulated_audio is None or len(accumulated_audio) == 0:
+            yield None, "❌ No audio generated", None, None, ""
+            return
+
+        final_duration = len(accumulated_audio) / sampling_rate
+
+        # Session complete - checkpoints kept for reference, cleaned up periodically
+
+        # Calculate timing stats
+        total_generation_time = time.time() - progress.start_time
+        realtime_factor = final_duration / total_generation_time if total_generation_time > 0 else 0
+        avg_chunk_time = total_generation_time / total_chunks if total_chunks > 0 else 0
+
+        # Final post-processing
+        current_sr = sampling_rate
+        if accumulated_audio.dtype != np.float32:
+            accumulated_audio = accumulated_audio.astype(np.float32)
+
+        # Apply ZipEnhancer and normalization to final accumulated audio
+        final_waveform, current_sr, saved_path, spectrogram_path = _postprocess_audio(
+            accumulated_audio, current_sr, normalize, normalize_level,
+            use_zipenhancer, target_sample_rate, bitrate, output_format
+        )
+
+        final_status = f"🎉 Generation complete!\n"
+        final_status += f"📦 Total chunks: {total_chunks}\n"
+        final_status += f"⏱️ Audio duration: {final_duration:.1f}s\n"
+        final_status += f"⏱️ Generation time: {total_generation_time:.1f}s\n"
+        final_status += f"⚡ Real-time factor: {realtime_factor:.2f}x\n"
+        final_status += f"🎲 Seed: {actual_seed}\n"
+        final_status += f"💾 Saved: {Path(saved_path).name}"
+
+        yield (current_sr, final_waveform), final_status, saved_path, spectrogram_path, ""
+
+    def _gen_core(text, language, ref_audio, instruct, num_step, guidance_scale, 
+                  denoise, speed, duration, preprocess_prompt, postprocess_output, 
+                  output_format, mode, ref_text=None,
+                  normalize=True, normalize_level=-20, use_zipenhancer=True,
+                  target_sample_rate=48000, bitrate=320, seed=-1, random_seed=True,
+                  enable_chunking=True, chunking_mode="lines",
+                  max_lines_per_chunk=8, max_sentences_per_chunk=5,
+                  max_chars_per_chunk=800, crossfade_ms=50):
+        """Generator that yields updates for Gradio streaming."""
+
+        for audio, status, saved_file, spectrogram, progress_html in _gen_core_chunked(
+            text, language, ref_audio, instruct, num_step, guidance_scale,
+            denoise, speed, duration, preprocess_prompt, postprocess_output,
+            output_format, mode, ref_text,
+            normalize, normalize_level, use_zipenhancer,
+            target_sample_rate, bitrate, seed, random_seed,
+            enable_chunking, chunking_mode,
+            max_lines_per_chunk, max_sentences_per_chunk,
+            max_chars_per_chunk, crossfade_ms
+        ):
+            # progress_html is either HTML content or empty string
+            # Just pass the HTML string directly - component is always visible now
+            yield audio, status, saved_file, spectrogram, progress_html
+
+    
+
+    theme = gr.themes.Soft(
+        primary_hue=gr.themes.colors.Color(
+            name="indigo",
+            c50="#eef2ff",
+            c100="#e0e7ff",
+            c200="#c7d2fe",
+            c300="#a5b4fc",
+            c400="#818cf8",
+            c500="#667eea",
+            c600="#5b6fd6",
+            c700="#4f5fbf",
+            c800="#444fa8",
+            c900="#3a3f91",
+            c950="#2d2f6e",
+        ),
+        secondary_hue=gr.themes.colors.Color(
+            name="purple",
+            c50="#faf5ff",
+            c100="#f3e8ff",
+            c200="#e9d5ff",
+            c300="#d8b4fe",
+            c400="#c084fc",
+            c500="#a855f7",
+            c600="#9333ea",
+            c700="#7e22ce",
+            c800="#6b21a8",
+            c900="#581c87",
+            c950="#3b0764",
+        ),
+        neutral_hue=gr.themes.colors.Color(
+            name="slate",
+            c50="#f8fafc",
+            c100="#f1f5f9",
+            c200="#e2e8f0",
+            c300="#cbd5e1",
+            c400="#94a3b8",
+            c500="#64748b",
+            c600="#475569",
+            c700="#334155",
+            c800="#1e293b",
+            c900="#0f172a",
+            c950="#020617",
+        ),
+        font=["Inter", "Arial", "sans-serif"],
+        font_mono=["ui-monospace", "Consolas", "monospace"],
+    )
 
     css = """
-    .gradio-container {max-width: 100% !important;}
+    /* === LAYOUT UTILITIES === */
     .square-btn {width: 40px !important; min-width: 40px !important; padding: 0 !important; height: 40px !important;}
     .voice-controls-row {align-items: center !important;}
     .voice-controls-row button {height: 40px !important; margin-top: 24px !important;}
@@ -785,12 +1638,19 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
     .seed-row {align-items: center !important; gap: 8px !important;}
     .seed-row button {height: 40px !important; margin-top: 24px !important; min-width: 40px !important;}
     .seed-row .form {margin-bottom: 0 !important;}
+    .chunking-row {align-items: center !important; gap: 8px !important;}
+    .chunking-row .form {margin-bottom: 0 !important;}
+
+    /* === SCROLLBAR === */
+    ::-webkit-scrollbar {width: 8px; height: 8px;}
+    ::-webkit-scrollbar-track {background: #0f172a;}
+    ::-webkit-scrollbar-thumb {background: linear-gradient(#667eea, #764ba2); border-radius: 4px;}
+    ::-webkit-scrollbar-thumb:hover {background: #667eea;}
     """
 
     # JavaScript to reload the current tab after server restart
     js_reload_on_ready = """
     () => {
-        // Show a restart message
         const statusText = document.querySelector('textarea[data-testid="textbox"]');
         if (statusText) {
             statusText.value = "⏳ Waiting for server restart...";
@@ -801,17 +1661,14 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
             try {
                 const resp = await fetch(window.location.origin, {cache: "no-store"});
                 if (resp.ok) {
-                    // The server is available - reload the current tab
                     window.location.reload();
                 } else {
                     setTimeout(checkServer, 800);
                 }
             } catch (e) {
-                // The server hasn't started yet - we're waiting.
                 setTimeout(checkServer, 800);
             }
         };
-        // We start checking in 1.5 seconds
         setTimeout(checkServer, 1500);
     }
     """
@@ -874,7 +1731,229 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
 
         return ns, gs, sp, du, dn, pp, po, fmt, sr, br, seed_input, random_seed_cb, random_seed_btn
 
-    with gr.Blocks(title="OmniVoice Portable") as demo:
+    def _chunking_settings():
+        """Chunking settings UI - ported from VibeVoice."""
+        with gr.Accordion("📦 Smart Chunking", open=True):
+            enable_chunking = gr.Checkbox(
+                label="Enable Smart Chunking",
+                value=settings.get("enable_chunking", True),
+                info="Split long text into chunks to prevent quality degradation. REQUIRED for long texts."
+            )
+
+            chunking_mode = gr.Dropdown(
+                choices=[
+                    ("Lines", "lines"),
+                    ("Sentences (. ! ? …)", "sentences"),
+                    ("Characters", "characters")
+                ],
+                value=settings.get("chunking_mode", "lines"),
+                label="Chunking Mode",
+                info="How to split the text into chunks"
+            )
+
+            # Use Tabs for reliable rendering of mode-specific sliders
+            with gr.Tabs() as chunking_tabs:
+                with gr.TabItem("Lines", id="lines"):
+                    max_lines = gr.Slider(
+                        minimum=1, maximum=20, value=settings.get("max_lines_per_chunk", 8), step=1,
+                        label="Max Lines Per Chunk",
+                        info="Lower = more stable voice, but more chunks"
+                    )
+
+                with gr.TabItem("Sentences", id="sentences"):
+                    max_sentences = gr.Slider(
+                        minimum=1, maximum=20, value=settings.get("max_sentences_per_chunk", 5), step=1,
+                        label="Max Sentences Per Chunk",
+                        info="Sentences end with . ! ? …"
+                    )
+
+                with gr.TabItem("Characters", id="characters"):
+                    max_chars = gr.Slider(
+                        minimum=100, maximum=3000, value=settings.get("max_chars_per_chunk", 800), step=50,
+                        label="Max Characters Per Chunk",
+                        info="Approximate character limit per chunk"
+                    )
+
+            crossfade_ms = gr.Slider(
+                minimum=50, maximum=200, value=settings.get("crossfade_ms", 50), step=10,
+                label="Crossfade Duration (ms)",
+                info="Smooth transition between chunks. 50ms is good for most cases."
+            )
+
+
+
+        return (enable_chunking, chunking_mode, chunking_tabs, max_lines, max_sentences, max_chars,
+                crossfade_ms)
+
+    # Dark theme style injection via HTML
+    dark_theme_css = """
+    <style id="omnivoice-dark-theme">
+    /* === DARK THEME OVERRIDES === */
+    /* These styles are injected into the page and override Gradio's defaults */
+
+    html, body {
+        background: #0f172a !important;
+        color: #e2e8f0 !important;
+    }
+
+    /* Main app container */
+    #app, .wrap, .gradio-container, [data-testid="block"] {
+        background: #0f172a !important;
+    }
+
+    /* All block/panel containers */
+    .block, .panel, .form, .component-wrapper, .container,
+    [class*="svelte-"][class*="block"],
+    [class*="svelte-"][class*="panel"] {
+        background: #1e293b !important;
+        border-color: #334155 !important;
+    }
+
+    /* Input elements */
+    input, textarea, select,
+    [class*="svelte-"][class*="input"],
+    [class*="svelte-"][class*="textbox"],
+    [class*="svelte-"][class*="number"],
+    [class*="svelte-"][class*="dropdown"] {
+        background: #1e293b !important;
+        border: 1px solid #334155 !important;
+        color: #e2e8f0 !important;
+        caret-color: #667eea !important;
+    }
+
+    input::placeholder, textarea::placeholder {
+        color: #64748b !important;
+    }
+
+    input:focus, textarea:focus, select:focus {
+        border-color: #667eea !important;
+        box-shadow: 0 0 0 2px rgba(102,126,234,0.2) !important;
+    }
+
+    /* Buttons - primary gradient */
+    button[class*="primary"], [class*="svelte-"][class*="primary"] {
+        background: linear-gradient(135deg, #667eea, #764ba2) !important;
+        border: none !important;
+        color: white !important;
+        font-weight: 600 !important;
+    }
+
+    button[class*="primary"]:hover {
+        filter: brightness(1.1) !important;
+        box-shadow: 0 4px 12px rgba(102,126,234,0.4) !important;
+    }
+
+    /* Buttons - secondary */
+    button[class*="secondary"], [class*="svelte-"][class*="secondary"] {
+        background: #1e293b !important;
+        border: 1px solid #334155 !important;
+        color: #94a3b8 !important;
+    }
+
+    button[class*="secondary"]:hover {
+        background: #334155 !important;
+        color: #e2e8f0 !important;
+    }
+
+    /* Tabs */
+    [class*="tab-nav"], [class*="tabs"] {
+        background: #1e293b !important;
+        border-bottom: 1px solid #334155 !important;
+    }
+
+    [role="tab"], button[role="tab"], [class*="tab"] {
+        color: #94a3b8 !important;
+        background: transparent !important;
+        border: none !important;
+        border-bottom: 2px solid transparent !important;
+    }
+
+    [role="tab"][aria-selected="true"], [class*="tab"][class*="selected"] {
+        color: #667eea !important;
+        border-bottom: 2px solid #667eea !important;
+        background: rgba(102,126,234,0.1) !important;
+    }
+
+    [class*="tabitem"], [role="tabpanel"] {
+        background: #0f172a !important;
+    }
+
+    /* Accordions */
+    [class*="accordion"], details, summary {
+        background: #1e293b !important;
+        border-color: #334155 !important;
+    }
+
+    [class*="accordion-header"], summary {
+        color: #e2e8f0 !important;
+    }
+
+    /* Sliders */
+    input[type="range"] {
+        accent-color: #667eea !important;
+    }
+
+    /* Checkboxes and radios */
+    input[type="checkbox"], input[type="radio"] {
+        accent-color: #667eea !important;
+    }
+
+    /* Labels */
+    label, [class*="label"], [class*="title"] {
+        color: #94a3b8 !important;
+    }
+
+    [class*="block-title"], [class*="main-title"] {
+        color: #e2e8f0 !important;
+        font-weight: 600 !important;
+    }
+
+    /* Audio player */
+    audio {
+        filter: hue-rotate(220deg) saturate(1.5) !important;
+    }
+
+    /* File upload */
+    [class*="upload"], [class*="dropzone"] {
+        background: #1e293b !important;
+        border: 2px dashed #334155 !important;
+        color: #94a3b8 !important;
+    }
+
+    [class*="upload"]:hover, [class*="dropzone"]:hover {
+        border-color: #667eea !important;
+    }
+
+    /* Dropdown options */
+    [class*="options"], [class*="dropdown-options"], [role="listbox"] {
+        background: #1e293b !important;
+        border: 1px solid #334155 !important;
+    }
+
+    [class*="options"] li, [role="option"] {
+        color: #e2e8f0 !important;
+    }
+
+    [class*="options"] li:hover, [role="option"]:hover {
+        background: rgba(102,126,234,0.2) !important;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar {width: 8px; height: 8px;}
+    ::-webkit-scrollbar-track {background: #0f172a;}
+    ::-webkit-scrollbar-thumb {background: linear-gradient(#667eea, #764ba2); border-radius: 4px;}
+    ::-webkit-scrollbar-thumb:hover {background: #667eea;}
+
+    /* Remove any orange/yellow artifacts */
+    [style*="orange"], [style*="#ff8c00"], [style*="#ffa500"] {
+        background: #1e293b !important;
+        border-color: #334155 !important;
+        color: #e2e8f0 !important;
+    }
+    </style>
+    """
+
+    with gr.Blocks(title="OmniVoice Portable", css=css, theme=theme) as demo:
         gr.Markdown("<div align='center'><h1>OmniVoice Portable</h1></div>")
 
         if torch.cuda.is_available():
@@ -886,7 +1965,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
             with gr.TabItem("Voice Clone"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        vc_text = gr.Textbox(label="Text", lines=3, placeholder="Enter text for voiceover...")
+                        vc_text = gr.Textbox(label="Text", lines=5, placeholder="Enter text for voiceover...")
 
                         # Paste, Clear, Copy buttons
                         with gr.Row():
@@ -912,6 +1991,10 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                         vc_lang = _lang_dropdown(value=settings.get("language", "Auto"))
                         vc_ns, vc_gs, vc_sp, vc_du, vc_dn, vc_pp, vc_po, vc_fmt, vc_sr, vc_br, vc_seed, vc_random_seed, vc_random_btn = _gen_settings()
 
+                        # Chunking settings
+                        (vc_enable_chunking, vc_chunking_mode, vc_chunking_tabs, vc_max_lines, vc_max_sentences, 
+                         vc_max_chars, vc_crossfade_ms) = _chunking_settings()
+
                         # Audio Processing controls
                         with gr.Accordion("🔊 Audio Processing", open=True):
                             vc_normalize = gr.Checkbox(
@@ -935,23 +2018,19 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                             vc_btn = gr.Button("🚀 Generate", variant="primary", scale=3)
                             vc_restart_btn = gr.Button("🔄 Restart UI", variant="secondary", scale=1)
 
+                        # Progress bar
+                        vc_progress = gr.HTML(value="", visible=True)
+
                         vc_audio = gr.Audio(label="Output", type="numpy")
-                        # Spectrogram output
                         vc_spectrogram = gr.Image(label="Spectrogram", type="filepath")
                         vc_status = gr.Textbox(label="Status", lines=2)
                         vc_saved_file = gr.File(label="Saved File", visible=True)
 
                 # Button click handlers
-                vc_clear_btn.click(
-                    lambda: "",
-                    inputs=None,
-                    outputs=vc_text,
-                )
+                vc_clear_btn.click(lambda: "", inputs=None, outputs=vc_text)
 
                 vc_paste_btn.click(
-                    None,
-                    inputs=None,
-                    outputs=vc_text,
+                    None, inputs=None, outputs=vc_text,
                     js="""
                     async () => {
                         try {
@@ -966,28 +2045,23 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                 )
 
                 vc_copy_btn.click(
-                    None,
-                    inputs=[vc_text],
-                    outputs=None,
+                    None, inputs=[vc_text], outputs=None,
                     js="(text) => navigator.clipboard.writeText(text)"
                 )
 
                 vc_refresh_btn.click(
                     lambda: gr.update(choices=get_voice_choices(), value="-NONE-"),
-                    inputs=None,
-                    outputs=vc_voice_selector,
+                    inputs=None, outputs=vc_voice_selector,
                 )
 
                 vc_download_btn.click(
                     lambda: download_reference_voices(),
-                    inputs=None,
-                    outputs=vc_voice_selector,
+                    inputs=None, outputs=vc_voice_selector,
                 )
 
                 vc_voice_selector.change(
                     lambda: (None, ""),
-                    inputs=None,
-                    outputs=[vc_ref_audio, vc_ref_text],
+                    inputs=None, outputs=[vc_ref_audio, vc_ref_text],
                 ).then(
                     set_voice_file,
                     inputs=[vc_voice_selector],
@@ -999,14 +2073,19 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                     new_seed = random.randint(0, 2**32 - 1)
                     return gr.update(value=new_seed)
 
-                vc_random_btn.click(
-                    _random_seed,
-                    inputs=None,
-                    outputs=vc_seed,
+                vc_random_btn.click(_random_seed, inputs=None, outputs=vc_seed)
+
+                # Chunking mode -> switch tabs
+                vc_chunking_mode.change(
+                    fn=lambda mode: gr.update(selected=mode),
+                    inputs=vc_chunking_mode,
+                    outputs=vc_chunking_tabs
                 )
 
                 def _clone_fn(text, lang, ref_aud, ref_text, ns, gs, dn, sp, du, pp, po, fmt, sr, br, seed, random_seed,
-                             normalize, norm_level, use_zipenhancer):
+                             normalize, norm_level, use_zipenhancer,
+                             enable_chunking, chunking_mode, max_lines, max_sentences, max_chars,
+                             crossfade_ms):
                     # Save settings before generation
                     current_settings = {
                         "speed": sp,
@@ -1024,20 +2103,34 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                         "normalize": normalize,
                         "normalize_level": norm_level,
                         "use_zipenhancer": use_zipenhancer,
+                        "enable_chunking": enable_chunking,
+                        "chunking_mode": chunking_mode,
+                        "max_lines_per_chunk": max_lines,
+                        "max_sentences_per_chunk": max_sentences,
+                        "max_chars_per_chunk": max_chars,
+                        "crossfade_ms": crossfade_ms,
                     }
                     save_settings(current_settings)
 
-                    return _gen_core(text, lang, ref_aud, None, ns, gs, dn, sp, du, pp, po, fmt,
+                    yield from _gen_core(text, lang, ref_aud, None, ns, gs, dn, sp, du, pp, po, fmt,
                                    mode="clone", ref_text=ref_text or None,
                                    normalize=normalize, normalize_level=norm_level,
                                    use_zipenhancer=use_zipenhancer,
                                    target_sample_rate=sr, bitrate=br,
-                                   seed=seed, random_seed=random_seed)
+                                   seed=seed, random_seed=random_seed,
+                                   enable_chunking=enable_chunking,
+                                   chunking_mode=chunking_mode,
+                                   max_lines_per_chunk=max_lines,
+                                   max_sentences_per_chunk=max_sentences,
+                                   max_chars_per_chunk=max_chars,
+                                   crossfade_ms=crossfade_ms)
 
                 vc_btn.click(_clone_fn,
                     inputs=[vc_text, vc_lang, vc_ref_audio, vc_ref_text, vc_ns, vc_gs, vc_dn, vc_sp, vc_du, vc_pp, vc_po, vc_fmt, vc_sr, vc_br, vc_seed, vc_random_seed,
-                           vc_normalize, vc_norm_level, vc_use_zipenhancer],
-                    outputs=[vc_audio, vc_status, vc_saved_file, vc_spectrogram])
+                           vc_normalize, vc_norm_level, vc_use_zipenhancer,
+                           vc_enable_chunking, vc_chunking_mode, vc_max_lines, vc_max_sentences, vc_max_chars,
+                           vc_crossfade_ms],
+                    outputs=[vc_audio, vc_status, vc_saved_file, vc_spectrogram, vc_progress])
 
                 vc_restart_btn.click(
                     restart_engine,
@@ -1050,7 +2143,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
             with gr.TabItem("Voice Design"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        vd_text = gr.Textbox(label="Text", lines=3, placeholder="Enter text for voiceover...")
+                        vd_text = gr.Textbox(label="Text", lines=5, placeholder="Enter text for voiceover...")
 
                         # Paste, Clear, Copy buttons
                         with gr.Row():
@@ -1080,6 +2173,10 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
 
                         vd_ns, vd_gs, vd_sp, vd_du, vd_dn, vd_pp, vd_po, vd_fmt, vd_sr, vd_br, vd_seed, vd_random_seed, vd_random_btn = _gen_settings()
 
+                        # Chunking settings
+                        (vd_enable_chunking, vd_chunking_mode, vd_chunking_tabs, vd_max_lines, vd_max_sentences, 
+                         vd_max_chars, vd_crossfade_ms) = _chunking_settings()
+
                         # Audio Processing controls
                         with gr.Accordion("🔊 Audio Processing", open=True):
                             vd_normalize = gr.Checkbox(
@@ -1103,23 +2200,19 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                             vd_btn = gr.Button("🚀 Generate", variant="primary", scale=3)
                             vd_restart_btn = gr.Button("🔄 Restart UI", variant="secondary", scale=1)
 
+                        # Progress bar
+                        vd_progress = gr.HTML(value="", visible=True)
+
                         vd_audio = gr.Audio(label="Output", type="numpy")
-                        # Spectrogram output
                         vd_spectrogram = gr.Image(label="Spectrogram", type="filepath")
                         vd_status = gr.Textbox(label="Status", lines=2)
                         vd_saved_file = gr.File(label="Saved File", visible=True)
 
                 # Button click handlers
-                vd_clear_btn.click(
-                    lambda: "",
-                    inputs=None,
-                    outputs=vd_text,
-                )
+                vd_clear_btn.click(lambda: "", inputs=None, outputs=vd_text)
 
                 vd_paste_btn.click(
-                    None,
-                    inputs=None,
-                    outputs=vd_text,
+                    None, inputs=None, outputs=vd_text,
                     js="""
                     async () => {
                         try {
@@ -1134,28 +2227,23 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                 )
 
                 vd_copy_btn.click(
-                    None,
-                    inputs=[vd_text],
-                    outputs=None,
+                    None, inputs=[vd_text], outputs=None,
                     js="(text) => navigator.clipboard.writeText(text)"
                 )
 
                 vd_refresh_btn.click(
                     lambda: gr.update(choices=get_voice_choices(), value="-NONE-"),
-                    inputs=None,
-                    outputs=vd_voice_selector,
+                    inputs=None, outputs=vd_voice_selector,
                 )
 
                 vd_download_btn.click(
                     lambda: download_reference_voices(),
-                    inputs=None,
-                    outputs=vd_voice_selector,
+                    inputs=None, outputs=vd_voice_selector,
                 )
 
                 vd_voice_selector.change(
                     lambda: None,
-                    inputs=None,
-                    outputs=[vd_ref_audio],
+                    inputs=None, outputs=[vd_ref_audio],
                 ).then(
                     set_voice_file,
                     inputs=[vd_voice_selector],
@@ -1163,10 +2251,13 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                 )
 
                 # Random seed button handler
-                vd_random_btn.click(
-                    _random_seed,
-                    inputs=None,
-                    outputs=vd_seed,
+                vd_random_btn.click(_random_seed, inputs=None, outputs=vd_seed)
+
+                # Chunking mode -> switch tabs
+                vd_chunking_mode.change(
+                    fn=lambda mode: gr.update(selected=mode),
+                    inputs=vd_chunking_mode,
+                    outputs=vd_chunking_tabs
                 )
 
                 def _build_instruct(groups):
@@ -1183,12 +2274,18 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                     return ", ".join(parts)
 
                 def _design_fn(text, lang, ref_aud, ns, gs, dn, sp, du, pp, po, fmt, sr, br, seed, random_seed, *args):
-                    # Separate groups from audio processing args
+                    # Separate groups from audio processing and chunking args
                     num_groups = len(vd_groups)
                     groups = args[:num_groups]
                     normalize = args[num_groups]
                     norm_level = args[num_groups + 1]
                     use_zipenhancer = args[num_groups + 2]
+                    enable_chunking = args[num_groups + 3]
+                    chunking_mode = args[num_groups + 4]
+                    max_lines = args[num_groups + 5]
+                    max_sentences = args[num_groups + 6]
+                    max_chars = args[num_groups + 7]
+                    crossfade_ms = args[num_groups + 8]
 
                     # Save settings before generation
                     current_settings = {
@@ -1207,27 +2304,50 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                         "normalize": normalize,
                         "normalize_level": norm_level,
                         "use_zipenhancer": use_zipenhancer,
+                        "enable_chunking": enable_chunking,
+                        "chunking_mode": chunking_mode,
+                        "max_lines_per_chunk": max_lines,
+                        "max_sentences_per_chunk": max_sentences,
+                        "max_chars_per_chunk": max_chars,
+                        "crossfade_ms": crossfade_ms,
                     }
                     save_settings(current_settings)
 
+                    instruct = _build_instruct(groups)
+
                     if ref_aud:
-                        return _gen_core(text, lang, ref_aud, None, ns, gs, dn, sp, du, pp, po, fmt,
+                        yield from _gen_core(text, lang, ref_aud, None, ns, gs, dn, sp, du, pp, po, fmt,
                                        mode="clone", ref_text=None,
                                        normalize=normalize, normalize_level=norm_level,
                                        use_zipenhancer=use_zipenhancer,
                                        target_sample_rate=sr, bitrate=br,
-                                       seed=seed, random_seed=random_seed)
+                                       seed=seed, random_seed=random_seed,
+                                       enable_chunking=enable_chunking,
+                                       chunking_mode=chunking_mode,
+                                       max_lines_per_chunk=max_lines,
+                                       max_sentences_per_chunk=max_sentences,
+                                       max_chars_per_chunk=max_chars,
+                                       crossfade_ms=crossfade_ms)
                     else:
-                        return _gen_core(text, lang, None, _build_instruct(groups), ns, gs, dn, sp, du, pp, po, fmt, 
+                        yield from _gen_core(text, lang, None, instruct, ns, gs, dn, sp, du, pp, po, fmt, 
                                        mode="design",
                                        normalize=normalize, normalize_level=norm_level,
                                        use_zipenhancer=use_zipenhancer,
                                        target_sample_rate=sr, bitrate=br,
-                                       seed=seed, random_seed=random_seed)
+                                       seed=seed, random_seed=random_seed,
+                                       enable_chunking=enable_chunking,
+                                       chunking_mode=chunking_mode,
+                                       max_lines_per_chunk=max_lines,
+                                       max_sentences_per_chunk=max_sentences,
+                                       max_chars_per_chunk=max_chars,
+                                       crossfade_ms=crossfade_ms)
 
                 vd_btn.click(_design_fn,
-                    inputs=[vd_text, vd_lang, vd_ref_audio, vd_ns, vd_gs, vd_dn, vd_sp, vd_du, vd_pp, vd_po, vd_fmt, vd_sr, vd_br, vd_seed, vd_random_seed] + vd_groups + [vd_normalize, vd_norm_level, vd_use_zipenhancer],
-                    outputs=[vd_audio, vd_status, vd_saved_file, vd_spectrogram])
+                    inputs=[vd_text, vd_lang, vd_ref_audio, vd_ns, vd_gs, vd_dn, vd_sp, vd_du, vd_pp, vd_po, vd_fmt, vd_sr, vd_br, vd_seed, vd_random_seed] + 
+                           vd_groups + [vd_normalize, vd_norm_level, vd_use_zipenhancer,
+                           vd_enable_chunking, vd_chunking_mode, vd_max_lines, vd_max_sentences, vd_max_chars,
+                           vd_crossfade_ms],
+                    outputs=[vd_audio, vd_status, vd_saved_file, vd_spectrogram, vd_progress])
 
                 vd_restart_btn.click(
                     restart_engine,
@@ -1239,6 +2359,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
         gr.Markdown(f"""
                 💾 Saving in: `{OUTPUTS_DIR}`
                 🎤 References in: `{REFERENCE_AUDIO_DIR}`
+                💾 Checkpoints in: `{CHECKPOINT_DIR}`
                 """)
 
         gr.Markdown(
@@ -1254,6 +2375,19 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
         )
 
     return demo
+
+
+def find_free_port(start_port: int = 7860, max_attempts: int = 20) -> int:
+    """Find first available port starting from start_port."""
+    import socket
+    for port in range(start_port, start_port + max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("", port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(f"No free ports found in range {start_port}-{start_port + max_attempts}")
 
 
 def main(argv=None) -> int:
@@ -1278,11 +2412,14 @@ def main(argv=None) -> int:
     logging.info(f"Outputs will be saved to: {OUTPUTS_DIR}")
     logging.info(f"Reference audio folder: {REFERENCE_AUDIO_DIR}")
     logging.info(f"Models folder: {MODELS_DIR}")
+    logging.info(f"Checkpoints folder: {CHECKPOINT_DIR}")
     logging.info(f"Model: {args.model}")
     logging.info(f"Target sample rate: {TARGET_SAMPLE_RATE}Hz")
     logging.info(f"Is restart: {is_restart}")
     logging.info(f"Auto-open browser: {not args.no_browser}")
     logging.info("=" * 60)
+
+    # Checkpoints are managed internally, no UI exposure for resume/cleanup
 
     model = FullOffloadOmniVoice(checkpoint=args.model)
 
@@ -1295,9 +2432,20 @@ def main(argv=None) -> int:
 
     logging.info(f"Opening browser: {should_open_browser}")
 
+    # Auto-find port if requested or if default is taken
+    launch_port = args.port
+    if args.find_port:
+        try:
+            launch_port = find_free_port(args.port)
+            if launch_port != args.port:
+                logging.info(f"Port {args.port} busy, using {launch_port}")
+        except RuntimeError as e:
+            logging.error(str(e))
+            return 1
+
     demo.queue().launch(
         server_name=args.ip, 
-        server_port=args.port, 
+        server_port=launch_port, 
         share=args.share, 
         root_path=args.root_path,
         inbrowser=should_open_browser

@@ -53,6 +53,7 @@ This project provided with only *.bat installer/re-installer/starter/updater fil
 - enhance speech quiality with ZipEnhancer model
 - normalization with dB level setting
 - output audio settings: samplerate and bitrate (for lossy formats)
+- added Smart Chunking with enhanced fine tuning (sentences/lines/characters) and progress bar for better voice generation expirience
 
 
 ## 📺 Credits
