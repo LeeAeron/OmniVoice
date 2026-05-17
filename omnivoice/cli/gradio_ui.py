@@ -990,6 +990,7 @@ def load_settings() -> Dict[str, Any]:
         "max_sentences_per_chunk": 5,
         "max_chars_per_chunk": 800,
         "crossfade_ms": 50,
+        "clear_checkpoints_on_startup": False,
     }
 
     if not SETTINGS_FILE.exists():
@@ -1529,6 +1530,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
         final_duration = len(accumulated_audio) / sampling_rate
 
         # Session complete - checkpoints kept for reference, cleaned up periodically
+        checkpoint_mgr.delete(session_id)
 
         # Calculate timing stats
         total_generation_time = time.time() - progress.start_time
@@ -1780,10 +1782,14 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                 info="Smooth transition between chunks. 50ms is good for most cases."
             )
 
-
+            clean_checkpoints_cb = gr.Checkbox(
+                label="🗑️ Clean checkpoints folder on startup",
+                value=settings.get("clear_checkpoints_on_startup", False),
+                info="Delete all checkpoint files when launching the interface"
+            )
 
         return (enable_chunking, chunking_mode, chunking_tabs, max_lines, max_sentences, max_chars,
-                crossfade_ms)
+                crossfade_ms, clean_checkpoints_cb)
 
     # Dark theme style injection via HTML
     dark_theme_css = """
@@ -1993,7 +1999,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
 
                         # Chunking settings
                         (vc_enable_chunking, vc_chunking_mode, vc_chunking_tabs, vc_max_lines, vc_max_sentences, 
-                         vc_max_chars, vc_crossfade_ms) = _chunking_settings()
+                         vc_max_chars, vc_crossfade_ms, vc_clean_checkpoints) = _chunking_settings()
 
                         # Audio Processing controls
                         with gr.Accordion("🔊 Audio Processing", open=True):
@@ -2085,7 +2091,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                 def _clone_fn(text, lang, ref_aud, ref_text, ns, gs, dn, sp, du, pp, po, fmt, sr, br, seed, random_seed,
                              normalize, norm_level, use_zipenhancer,
                              enable_chunking, chunking_mode, max_lines, max_sentences, max_chars,
-                             crossfade_ms):
+                             crossfade_ms, clean_checkpoints):
                     # Save settings before generation
                     current_settings = {
                         "speed": sp,
@@ -2109,6 +2115,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                         "max_sentences_per_chunk": max_sentences,
                         "max_chars_per_chunk": max_chars,
                         "crossfade_ms": crossfade_ms,
+                        "clear_checkpoints_on_startup": clean_checkpoints,
                     }
                     save_settings(current_settings)
 
@@ -2129,7 +2136,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                     inputs=[vc_text, vc_lang, vc_ref_audio, vc_ref_text, vc_ns, vc_gs, vc_dn, vc_sp, vc_du, vc_pp, vc_po, vc_fmt, vc_sr, vc_br, vc_seed, vc_random_seed,
                            vc_normalize, vc_norm_level, vc_use_zipenhancer,
                            vc_enable_chunking, vc_chunking_mode, vc_max_lines, vc_max_sentences, vc_max_chars,
-                           vc_crossfade_ms],
+                           vc_crossfade_ms, vc_clean_checkpoints],
                     outputs=[vc_audio, vc_status, vc_saved_file, vc_spectrogram, vc_progress])
 
                 vc_restart_btn.click(
@@ -2175,7 +2182,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
 
                         # Chunking settings
                         (vd_enable_chunking, vd_chunking_mode, vd_chunking_tabs, vd_max_lines, vd_max_sentences, 
-                         vd_max_chars, vd_crossfade_ms) = _chunking_settings()
+                         vd_max_chars, vd_crossfade_ms, vd_clean_checkpoints) = _chunking_settings()
 
                         # Audio Processing controls
                         with gr.Accordion("🔊 Audio Processing", open=True):
@@ -2286,6 +2293,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                     max_sentences = args[num_groups + 6]
                     max_chars = args[num_groups + 7]
                     crossfade_ms = args[num_groups + 8]
+                    clean_checkpoints = args[num_groups + 9]
 
                     # Save settings before generation
                     current_settings = {
@@ -2310,6 +2318,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                         "max_sentences_per_chunk": max_sentences,
                         "max_chars_per_chunk": max_chars,
                         "crossfade_ms": crossfade_ms,
+                        "clear_checkpoints_on_startup": clean_checkpoints,
                     }
                     save_settings(current_settings)
 
@@ -2346,7 +2355,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                     inputs=[vd_text, vd_lang, vd_ref_audio, vd_ns, vd_gs, vd_dn, vd_sp, vd_du, vd_pp, vd_po, vd_fmt, vd_sr, vd_br, vd_seed, vd_random_seed] + 
                            vd_groups + [vd_normalize, vd_norm_level, vd_use_zipenhancer,
                            vd_enable_chunking, vd_chunking_mode, vd_max_lines, vd_max_sentences, vd_max_chars,
-                           vd_crossfade_ms],
+                           vd_crossfade_ms, vd_clean_checkpoints],
                     outputs=[vd_audio, vd_status, vd_saved_file, vd_spectrogram, vd_progress])
 
                 vd_restart_btn.click(
@@ -2419,7 +2428,11 @@ def main(argv=None) -> int:
     logging.info(f"Auto-open browser: {not args.no_browser}")
     logging.info("=" * 60)
 
-    # Checkpoints are managed internally, no UI exposure for resume/cleanup
+    # Clean checkpoints on startup if setting is enabled
+    settings = load_settings()
+    if settings.get("clear_checkpoints_on_startup", False):
+        logging.info("🗑️ Checkpoint cleanup enabled in settings, cleaning...")
+        cleanup_checkpoints_folder()
 
     model = FullOffloadOmniVoice(checkpoint=args.model)
 
