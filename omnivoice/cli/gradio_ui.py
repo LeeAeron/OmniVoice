@@ -88,8 +88,32 @@ _CATEGORIES = {
     "Age": ["Child", "Teenager", "Young Adult", "Middle-aged", "Elderly"],
     "Pitch": ["Very Low", "Low", "Moderate", "High", "Very High"],
     "Style": ["Whisper"],
-    "English Accent": ["American", "British", "Chinese"],
-    "Chinese Dialect": ["Sichuan", "Northeast"],
+    "English Accent": [
+        "American Accent",
+        "Australian Accent",
+        "British Accent",
+        "Canadian Accent",
+        "Chinese Accent",
+        "Indian Accent",
+        "Japanese Accent",
+        "Korean Accent",
+        "Portuguese Accent",
+        "Russian Accent",
+    ],
+    "Chinese Dialect": [
+        "Sichuan",
+        "Northeast",
+        "Henan",
+        "Shaanxi",
+        "Guizhou",
+        "Yunnan",
+        "Guilin",
+        "Jinan",
+        "Shijiazhuang",
+        "Gansu",
+        "Ningxia",
+        "Qingdao",
+    ],
 }
 
 _ALL_LANGUAGES = ["Auto"] + sorted(lang_display_name(n) for n in LANG_NAMES)
@@ -1195,6 +1219,72 @@ def build_parser() -> argparse.ArgumentParser:
 def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
     sampling_rate = model.sampling_rate
     settings = load_settings()
+    theme = gr.themes.Soft(
+        primary_hue=gr.themes.colors.Color(
+            name="indigo",
+            c50="#eef2ff",
+            c100="#e0e7ff",
+            c200="#c7d2fe",
+            c300="#a5b4fc",
+            c400="#818cf8",
+            c500="#667eea",
+            c600="#5b6fd6",
+            c700="#4f5fbf",
+            c800="#444fa8",
+            c900="#3a3f91",
+            c950="#2d2f6e",
+        ),
+        secondary_hue=gr.themes.colors.Color(
+            name="purple",
+            c50="#faf5ff",
+            c100="#f3e8ff",
+            c200="#e9d5ff",
+            c300="#d8b4fe",
+            c400="#c084fc",
+            c500="#a855f7",
+            c600="#9333ea",
+            c700="#7e22ce",
+            c800="#6b21a8",
+            c900="#581c87",
+            c950="#3b0764",
+        ),
+        neutral_hue=gr.themes.colors.Color(
+            name="slate",
+            c50="#f8fafc",
+            c100="#f1f5f9",
+            c200="#e2e8f0",
+            c300="#cbd5e1",
+            c400="#94a3b8",
+            c500="#64748b",
+            c600="#475569",
+            c700="#334155",
+            c800="#1e293b",
+            c900="#0f172a",
+            c950="#020617",
+        ),
+        font=["Inter", "Arial", "sans-serif"],
+        font_mono=["ui-monospace", "Consolas", "monospace"],
+    )
+
+    css = """
+    /* === LAYOUT UTILITIES === */
+    .square-btn {width: 40px !important; min-width: 40px !important; padding: 0 !important; height: 40px !important;}
+    .voice-controls-row {align-items: center !important;}
+    .voice-controls-row button {height: 40px !important; margin-top: 24px !important;}
+    .generate-btn-row {margin-bottom: 10px !important;}
+    .seed-row {align-items: center !important; gap: 8px !important;}
+    .seed-row button {height: 40px !important; margin-top: 24px !important; min-width: 40px !important;}
+    .seed-row .form {margin-bottom: 0 !important;}
+    .chunking-row {align-items: center !important; gap: 8px !important;}
+    .chunking-row .form {margin-bottom: 0 !important;}
+
+    /* === SCROLLBAR === */
+    ::-webkit-scrollbar {width: 8px; height: 8px;}
+    ::-webkit-scrollbar-track {background: #0f172a;}
+    ::-webkit-scrollbar-thumb {background: linear-gradient(#667eea, #764ba2); border-radius: 4px;}
+    ::-webkit-scrollbar-thumb:hover {background: #667eea;}
+    """
+
 
     # Initialize ZipEnhancer if needed (lazy load on first use)
     zipenhancer = None
@@ -1377,6 +1467,15 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
 
         # Check if chunking should be used
         should_chunk = False
+
+        # Voice Design without reference audio cannot use chunking
+        # because instruct-based voice generation is not consistent across chunks
+        if mode == "design" and not ref_audio:
+            if enable_chunking:
+                logging.warning("[Voice Design] Chunking auto-disabled: instruct-based voice generation requires consistent seed and no reference audio for chunking")
+            # Force disable chunking for pure voice design
+            enable_chunking = False
+
         if enable_chunking:
             if chunking_mode == "lines":
                 total_lines = len([l for l in text.strip().split("\n") if l.strip()])
@@ -1959,7 +2058,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
     </style>
     """
 
-    with gr.Blocks(title="OmniVoice Portable", css=css, theme=theme) as demo:
+    with gr.Blocks(title="OmniVoice Portable") as demo:
         gr.Markdown("<div align='center'><h1>OmniVoice Portable</h1></div>")
 
         if torch.cuda.is_available():
@@ -2268,17 +2367,52 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
                 )
 
                 def _build_instruct(groups):
+                    """Build instruct string from dropdown selections.
+                    Maps display names to model-expected lowercase format.
+                    English items use comma+space, Chinese use full-width comma.
+                    """
+                    _DISPLAY_TO_MODEL = {
+                        "Male": "male", "Female": "female",
+                        "Child": "child", "Teenager": "teenager",
+                        "Young Adult": "young adult", "Middle-aged": "middle-aged",
+                        "Elderly": "elderly",
+                        "Very Low": "very low pitch", "Low": "low pitch",
+                        "Moderate": "moderate pitch", "High": "high pitch",
+                        "Very High": "very high pitch",
+                        "Whisper": "whisper",
+                        "American Accent": "american accent",
+                        "Australian Accent": "australian accent",
+                        "British Accent": "british accent",
+                        "Canadian Accent": "canadian accent",
+                        "Chinese Accent": "chinese accent",
+                        "Indian Accent": "indian accent",
+                        "Japanese Accent": "japanese accent",
+                        "Korean Accent": "korean accent",
+                        "Portuguese Accent": "portuguese accent",
+                        "Russian Accent": "russian accent",
+                        "Sichuan": "四川话", "Northeast": "东北话",
+                        "Henan": "河南话", "Shaanxi": "陕西话",
+                        "Guizhou": "贵州话", "Yunnan": "云南话",
+                        "Guilin": "桂林话", "Jinan": "济南话",
+                        "Shijiazhuang": "石家庄话", "Gansu": "甘肃话",
+                        "Ningxia": "宁夏话", "Qingdao": "青岛话",
+                    }
                     selected = [g for g in groups if g and g != "Auto"]
                     if not selected:
                         return None
-                    parts = []
+                    english = []
+                    chinese = []
                     for v in selected:
-                        if " / " in v:
-                            ru_part = v.split(" / ", 1)[0].strip()
-                            parts.append(ru_part)
+                        m = _DISPLAY_TO_MODEL.get(v, v)
+                        if any('一' <= c <= '鿿' for c in m):
+                            chinese.append(m)
                         else:
-                            parts.append(v)
-                    return ", ".join(parts)
+                            english.append(m)
+                    if chinese and english:
+                        return "，".join(chinese + english)
+                    if chinese:
+                        return "，".join(chinese)
+                    return ", ".join(english)
 
                 def _design_fn(text, lang, ref_aud, ns, gs, dn, sp, du, pp, po, fmt, sr, br, seed, random_seed, *args):
                     # Separate groups from audio processing and chunking args
@@ -2383,7 +2517,7 @@ def build_demo(model: FullOffloadOmniVoice, checkpoint: str) -> gr.Blocks:
             """
         )
 
-    return demo
+    return demo, theme, css
 
 
 def find_free_port(start_port: int = 7860, max_attempts: int = 20) -> int:
@@ -2436,7 +2570,7 @@ def main(argv=None) -> int:
 
     model = FullOffloadOmniVoice(checkpoint=args.model)
 
-    demo = build_demo(model, args.model)
+    demo, theme, css = build_demo(model, args.model)
 
     # Open the browser only if:
     # 1. --no-browser not specified
@@ -2461,7 +2595,9 @@ def main(argv=None) -> int:
         server_port=launch_port, 
         share=args.share, 
         root_path=args.root_path,
-        inbrowser=should_open_browser
+        inbrowser=should_open_browser,
+        theme=theme,
+        css=css
     )
     return 0
 
